@@ -3,10 +3,11 @@
 //! Day 3 fills in the real types described in `deep-research-report.md`:
 //! a flat `Vec<ChunkItem>` keyed by doc range, wrapped in an
 //! [`ArcSwap`] so the query loop can read a consistent snapshot with a
-//! single atomic load. The bigram posting list is deferred to Day 4
-//! (the `BaseIndex::bigrams` field is left as `None` until then), and
-//! the mutable overlay is deferred to Day 5 (the [`Overlay`] field is
-//! kept here as a no-op placeholder so wiring downstream is stable).
+//! single atomic load. Day 4 attaches a [`BigramIndex`] to
+//! `BaseIndex.bigrams` so the query path can do candidate generation
+//! before verifying. The mutable overlay is deferred to Day 5 (the
+//! [`Overlay`] field is kept here as a no-op placeholder so wiring
+//! downstream is stable).
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -16,7 +17,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::bigram::BigramIndex;
+use crate::bigram::{BigramIndex, build_bigram_index_from_chunks};
 use crate::db::Db;
 
 /// One indexed chunk loaded from `chunks` into memory.
@@ -47,7 +48,11 @@ pub struct ChunkItem {
 /// operations (a future incremental update, e.g.) can locate their
 /// chunks cheaply.
 ///
-/// `bigrams` is `None` for Day 3; Day 4 fills it in.
+/// `bigrams` is `Some` whenever the index has at least one chunk; for
+/// an empty corpus it is left as `None` because the prefilter has
+/// nothing useful to do and the caller should fall straight through
+/// to the verification path (an empty `Vec<ChunkItem>` makes that
+/// trivial).
 pub struct BaseIndex {
     pub chunks: Arc<Vec<ChunkItem>>,
     pub doc_ranges: HashMap<i64, Range<usize>>,
@@ -160,10 +165,16 @@ pub fn load_base_index_from_db(db: &Db) -> Result<BaseIndex> {
         doc_ranges.insert(prev_id, prev_start..chunks.len());
     }
 
+    let bigrams = if chunks.is_empty() {
+        None
+    } else {
+        Some(Arc::new(build_bigram_index_from_chunks(&chunks)))
+    };
+
     Ok(BaseIndex {
         chunks: Arc::new(chunks),
         doc_ranges,
-        bigrams: None,
+        bigrams,
         built_at_ms: now_ms(),
     })
 }
@@ -220,7 +231,28 @@ mod tests {
         let base = load_base_index_from_db(&db)?;
         assert!(base.chunks.is_empty());
         assert!(base.doc_ranges.is_empty());
+        // No chunks → no prefilter is built (full-scan over the
+        // empty Vec is trivial).
         assert!(base.bigrams.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn populated_db_attaches_bigram_index() -> Result<()> {
+        let tmp = tempdir()?;
+        let db_path = tmp.path().join("idx.db");
+        let mut db = Db::open(&db_path)?;
+        db.upsert_extracted(&fake_doc(
+            PathBuf::from("/tmp/a.pdf"),
+            &[("alpha bravo charlie", 1)],
+        ))?;
+        drop(db);
+
+        let db = Db::open(&db_path)?;
+        let base = load_base_index_from_db(&db)?;
+        let bigrams = base.bigrams.as_ref().expect("bigrams attached");
+        assert_eq!(bigrams.populated(), base.chunks.len());
+        assert_eq!(bigrams.item_count(), base.chunks.len());
         Ok(())
     }
 

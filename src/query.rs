@@ -1,11 +1,20 @@
 //! Search engine over an [`IndexState`].
 //!
-//! Day 3 implements a single literal-search mode: normalize the query
-//! through `crate::normalize::normalize_query_ascii`, then linear-scan
-//! every active chunk's `text_norm_ascii` with a compiled
-//! `memchr::memmem::Finder` to verify each hit. Day 4 will plug the
-//! bigram prefilter in front of this scan; today's code path is the
-//! "verification scan" that prefilter will gate.
+//! Literal search runs in two stages:
+//!
+//! 1. **Candidate generation.** Normalize the query through
+//!    `crate::normalize::normalize_query_ascii`, then ask the
+//!    [`BigramIndex`] for a bitset of items that *might* contain the
+//!    query. When the index has no information about the query (either
+//!    the index is missing, the query is too short, or none of the
+//!    query's bigrams survived compression), the candidate set falls
+//!    back to "every active chunk".
+//! 2. **Verification.** For each candidate, run a compiled
+//!    `memchr::memmem::Finder` over `text_norm_ascii`. The finder is
+//!    the source of truth for whether a chunk is a real hit; the
+//!    bigram prefilter never decides hits, only narrows.
+//!
+//! Day 6 plumbs the same prefilter into regex / fuzzy modes.
 //!
 //! Snippet rendering is best-effort: the normalized bytes
 //! (`text_norm_ascii`) do not byte-align with the original
@@ -28,12 +37,20 @@
 
 use anyhow::{Result, bail};
 use memchr::memmem;
+use tracing::warn;
 
+use crate::bigram::BigramIndex;
 use crate::index::{ChunkItem, IndexState};
 use crate::normalize::normalize_query_ascii;
 
 /// CLI / TUI cap on the number of hits surfaced to the user.
 pub const DISPLAY_LIMIT: usize = 200;
+
+/// Below this length the bigram prefilter has too little information to
+/// be useful (only one or zero bigrams), so we fall back to a full
+/// scan. Warn at that point so the user understands why a 1-byte
+/// query is slow on a large corpus.
+const NO_BIGRAM_FULLSCAN_WARN_LEN: usize = 2;
 
 /// How many bytes of `text_utf8` to include on each side of the
 /// approximate match offset when rendering a snippet.
@@ -62,12 +79,14 @@ pub struct Hit {
 
 /// Run `query` against the current `BaseIndex` snapshot.
 ///
-/// Day-3 contract:
+/// Contract:
 /// * Empty / whitespace-only queries return no hits.
-/// * `QueryMode::Literal` scans every chunk; results are returned in
-///   `(doc_id, chunk_ord)` order, capped at `limit`.
+/// * `QueryMode::Literal` narrows the candidate set with the bigram
+///   prefilter (when available), then verifies each candidate with
+///   `memchr::memmem`; results are returned in `(doc_id, chunk_ord)`
+///   order, capped at `limit`.
 /// * `QueryMode::Regex` and `QueryMode::Fuzzy` return an error — they
-///   land in the Day-6 bigram-prefilter milestone.
+///   land in the Day-6 milestone.
 pub fn search(
     state: &IndexState,
     query: &str,
@@ -84,21 +103,58 @@ pub fn search(
 
 fn literal_search(state: &IndexState, query: &str, limit: usize) -> Result<Vec<Hit>> {
     let q = normalize_query_ascii(query);
-    if q.is_empty() {
+    if q.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
     let needle = q.as_bytes();
     let finder = memmem::Finder::new(needle);
 
     let base = state.load_base();
+
+    // Stage 1: candidate generation via the bigram prefilter.
+    //
+    // `bigrams.query()` returns `Some(bitset)` when at least one of
+    // the query's bigrams was tracked. If `None`, the prefilter has
+    // zero information and we must consider every chunk a candidate.
+    let candidates: Option<Vec<u64>> = base
+        .bigrams
+        .as_ref()
+        .and_then(|idx| idx.query(needle));
+
+    if needle.len() < NO_BIGRAM_FULLSCAN_WARN_LEN {
+        warn!(
+            len = needle.len(),
+            "literal query is too short for the bigram prefilter; falling back to full scan",
+        );
+    }
+
+    // Stage 2: verification scan.
     let mut hits: Vec<Hit> = Vec::new();
-    for chunk in base.chunks.iter() {
-        let Some(pos) = finder.find(&chunk.text_norm_ascii) else {
-            continue;
-        };
-        hits.push(make_hit(chunk, pos, needle.len()));
-        if hits.len() >= limit {
-            break;
+    match candidates {
+        Some(bitset) => {
+            for (i, chunk) in base.chunks.iter().enumerate() {
+                if !BigramIndex::is_candidate(&bitset, i) {
+                    continue;
+                }
+                let Some(pos) = finder.find(&chunk.text_norm_ascii) else {
+                    continue;
+                };
+                hits.push(make_hit(chunk, pos, needle.len()));
+                if hits.len() >= limit {
+                    break;
+                }
+            }
+        }
+        None => {
+            for chunk in base.chunks.iter() {
+                let Some(pos) = finder.find(&chunk.text_norm_ascii) else {
+                    continue;
+                };
+                hits.push(make_hit(chunk, pos, needle.len()));
+                if hits.len() >= limit {
+                    break;
+                }
+            }
         }
     }
     Ok(hits)
@@ -203,10 +259,21 @@ mod tests {
         if let Some((d, s)) = cur {
             doc_ranges.insert(d, s..chunks.len());
         }
+        // Build the bigram prefilter from the same chunks so unit
+        // tests exercise the candidate-generation path (not just the
+        // fallback). Empty corpora skip it because no chunks means no
+        // candidates anyway.
+        let bigrams = if chunks.is_empty() {
+            None
+        } else {
+            Some(Arc::new(crate::bigram::build_bigram_index_from_chunks(
+                &chunks,
+            )))
+        };
         let base = BaseIndex {
             chunks: Arc::new(chunks),
             doc_ranges,
-            bigrams: None,
+            bigrams,
             built_at_ms: 0,
         };
         IndexState::new(base)

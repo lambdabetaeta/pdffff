@@ -12,7 +12,9 @@ use anyhow::Result;
 use tempfile::tempdir;
 
 use pdffff::app::{IndexOptions, run_index, run_search};
+use pdffff::db::Db;
 use pdffff::extract::ensure_pdftotext_available;
+use pdffff::index::load_base_index_from_db;
 use pdffff::query::{DISPLAY_LIMIT, QueryMode};
 
 fn require_pdftotext_or_skip(test_name: &str) -> bool {
@@ -114,6 +116,74 @@ fn search_respects_display_limit() -> Result<()> {
 
     let hits = run_search(&db_path, "needle", QueryMode::Literal, 3)?;
     assert_eq!(hits.len(), 3, "limit must cap the returned hits");
+    Ok(())
+}
+
+#[test]
+fn loaded_base_index_has_bigram_prefilter_attached() -> Result<()> {
+    if !require_pdftotext_or_skip("loaded_base_index_has_bigram_prefilter_attached") {
+        return Ok(());
+    }
+
+    let tmp = tempdir()?;
+    let root = tmp.path().join("docs");
+    std::fs::create_dir_all(&root)?;
+    let pdf_path = root.join("paper.pdf");
+    common::make_pdf_two_pages(
+        &pdf_path,
+        &["alpha bravo charlie"],
+        &["delta echo foxtrot"],
+    );
+
+    let db_path = tmp.path().join("idx.db");
+    let stats = run_index(&db_path, &root, &opts())?;
+    assert_eq!(stats.ok, 1);
+
+    // Reload the way `run_search` would and inspect the attached
+    // bigram index directly.
+    let db = Db::open(&db_path)?;
+    let base = load_base_index_from_db(&db)?;
+    let bigrams = base.bigrams.as_ref().expect("bigrams attached after Day 4");
+    assert_eq!(
+        bigrams.populated(),
+        base.chunks.len(),
+        "every chunk should contribute to the bigram index",
+    );
+    Ok(())
+}
+
+#[test]
+fn search_finds_token_unique_to_one_document() -> Result<()> {
+    if !require_pdftotext_or_skip("search_finds_token_unique_to_one_document") {
+        return Ok(());
+    }
+
+    let tmp = tempdir()?;
+    let root = tmp.path().join("docs");
+    std::fs::create_dir_all(&root)?;
+    let a = root.join("a.pdf");
+    let b = root.join("b.pdf");
+    let c = root.join("c.pdf");
+    common::make_pdf_two_pages(&a, &["common page words"], &["nothing special here"]);
+    common::make_pdf_two_pages(&b, &["unrelated content"], &["another generic page"]);
+    // Only c contains the distinctive token.
+    common::make_pdf_two_pages(
+        &c,
+        &["totally normal text"],
+        &["the magic word is xylotomous"],
+    );
+
+    let db_path = tmp.path().join("idx.db");
+    let stats = run_index(&db_path, &root, &opts())?;
+    assert_eq!(stats.ok, 3);
+
+    let hits = run_search(&db_path, "xylotomous", QueryMode::Literal, DISPLAY_LIMIT)?;
+    assert_eq!(hits.len(), 1, "exactly one hit for the unique token");
+    assert_eq!(
+        hits[0].path,
+        c.to_string_lossy(),
+        "the hit must be in the document containing the token",
+    );
     Ok(())
 }
 
