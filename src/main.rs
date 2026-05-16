@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing_subscriber::{EnvFilter, fmt};
 
+use pdffff::app::{IndexOptions, run_index};
 use pdffff::db::Db;
 use pdffff::scanner::Scanner;
 
@@ -19,7 +20,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Walk a directory and report the diff against the database.
+    /// Walk a directory and report the diff against the database (dry run).
     Scan {
         /// Directory to walk recursively.
         root: PathBuf,
@@ -29,6 +30,21 @@ enum Command {
         /// Follow symlinks.
         #[arg(long)]
         follow_symlinks: bool,
+    },
+    /// Scan, extract every dirty PDF with a worker pool, and persist
+    /// chunks to SQLite. Tombstones any paths that disappeared from disk.
+    Index {
+        /// Directory to walk recursively.
+        root: PathBuf,
+        /// Respect .gitignore / .ignore files.
+        #[arg(long)]
+        respect_ignore: bool,
+        /// Follow symlinks.
+        #[arg(long)]
+        follow_symlinks: bool,
+        /// Override extractor pool size. Default: min(num_cpus, 6).
+        #[arg(long)]
+        jobs: Option<usize>,
     },
     /// Show database statistics.
     Info,
@@ -45,6 +61,12 @@ fn main() -> Result<()> {
             respect_ignore,
             follow_symlinks,
         } => cmd_scan(&cli.db, &root, respect_ignore, follow_symlinks),
+        Command::Index {
+            root,
+            respect_ignore,
+            follow_symlinks,
+            jobs,
+        } => cmd_index(&cli.db, &root, respect_ignore, follow_symlinks, jobs),
         Command::Info => cmd_info(&cli.db),
     }
 }
@@ -67,6 +89,33 @@ fn cmd_scan(db_path: &PathBuf, root: &PathBuf, respect_ignore: bool, follow_syml
     for path in &result.deleted {
         println!("  [DELETED] {}", path.display());
     }
+    Ok(())
+}
+
+fn cmd_index(
+    db_path: &PathBuf,
+    root: &PathBuf,
+    respect_ignore: bool,
+    follow_symlinks: bool,
+    jobs: Option<usize>,
+) -> Result<()> {
+    let opts = IndexOptions {
+        respect_gitignore: respect_ignore,
+        follow_symlinks,
+        jobs,
+        require_pdftotext: true,
+    };
+    let stats = run_index(db_path, root, &opts)?;
+    println!(
+        "indexed: seen={} dirty={} ok={} empty={} error={} deleted={} elapsed={:.2}s",
+        stats.seen,
+        stats.dirty,
+        stats.ok,
+        stats.empty,
+        stats.error,
+        stats.deleted,
+        stats.elapsed_secs,
+    );
     Ok(())
 }
 
