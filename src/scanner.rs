@@ -52,6 +52,43 @@ pub struct ScanResult {
     pub seen_count: usize,
 }
 
+/// Build a [`ScanJob`] for a single existing path. Used by the watcher
+/// coordinator to convert a Dirty(path) event into an extraction job
+/// without re-walking the tree.
+///
+/// Returns `Ok(None)` if the path is not an existing regular file or
+/// not a `.pdf`; the coordinator silently drops those events.
+pub fn scan_one(path: &std::path::Path, reason: DirtyReason) -> Result<Option<ScanJob>> {
+    if !path.extension().is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("pdf")) {
+        return Ok(None);
+    }
+    let md = match path.metadata() {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    if !md.is_file() {
+        return Ok(None);
+    }
+    let size_bytes = md.len() as i64;
+    let mtime_ns = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    let dev = Some(md.dev() as i64);
+    let ino = Some(md.ino() as i64);
+    Ok(Some(ScanJob {
+        path: path.to_path_buf(),
+        size_bytes,
+        mtime_ns,
+        dev,
+        ino,
+        reason,
+    }))
+}
+
 pub struct Scanner {
     pub root: PathBuf,
     pub follow_symlinks: bool,

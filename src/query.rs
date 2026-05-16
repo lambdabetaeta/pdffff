@@ -1,20 +1,36 @@
 //! Search engine over an [`IndexState`].
 //!
-//! Literal search runs in two stages:
+//! Literal search runs in two stages, with the Day-5 overlay layered
+//! on top of the base index:
 //!
 //! 1. **Candidate generation.** Normalize the query through
 //!    `crate::normalize::normalize_query_ascii`, then ask the
-//!    [`BigramIndex`] for a bitset of items that *might* contain the
-//!    query. When the index has no information about the query (either
-//!    the index is missing, the query is too short, or none of the
-//!    query's bigrams survived compression), the candidate set falls
-//!    back to "every active chunk".
-//! 2. **Verification.** For each candidate, run a compiled
+//!    [`BigramIndex`] for a bitset of base items that *might* contain
+//!    the query. When the index has no information about the query
+//!    (either the index is missing, the query is too short, or none
+//!    of the query's bigrams survived compression), the candidate
+//!    set falls back to "every active chunk".
+//! 2. **Tombstone mask.** If the overlay has tombstoned base chunks
+//!    we AND-NOT the tombstone bitset into the candidate bitset
+//!    before verification, so stale base chunks never reach the
+//!    verifier. When the candidate set is the fallback "everything",
+//!    the verification loop checks `Overlay::is_tombstoned` per chunk.
+//! 3. **Verification.** For each surviving candidate, run a compiled
 //!    `memchr::memmem::Finder` over `text_norm_ascii`. The finder is
 //!    the source of truth for whether a chunk is a real hit; the
 //!    bigram prefilter never decides hits, only narrows.
+//! 4. **Overflow pass.** Extract the query's bigrams once, ask the
+//!    overlay for the indices of overflow chunks that pass the
+//!    overlay-side bigram prefilter, and verify them with the same
+//!    finder.
 //!
 //! Day 6 plumbs the same prefilter into regex / fuzzy modes.
+//!
+//! The base index and the overlay are read under a single
+//! `state.overlay.read()` guard that brackets both verification
+//! passes. That gives a consistent snapshot: the overlay cannot be
+//! mutated between deciding which base chunks are still live and
+//! walking the overflow rows.
 //!
 //! Snippet rendering is best-effort: the normalized bytes
 //! (`text_norm_ascii`) do not byte-align with the original
@@ -39,7 +55,7 @@ use anyhow::{Result, bail};
 use memchr::memmem;
 use tracing::warn;
 
-use crate::bigram::BigramIndex;
+use crate::bigram::{BigramIndex, extract_bigrams};
 use crate::index::{ChunkItem, IndexState};
 use crate::normalize::normalize_query_ascii;
 
@@ -82,9 +98,10 @@ pub struct Hit {
 /// Contract:
 /// * Empty / whitespace-only queries return no hits.
 /// * `QueryMode::Literal` narrows the candidate set with the bigram
-///   prefilter (when available), then verifies each candidate with
-///   `memchr::memmem`; results are returned in `(doc_id, chunk_ord)`
-///   order, capped at `limit`.
+///   prefilter (when available), masks out overlay tombstones, then
+///   verifies each candidate with `memchr::memmem`. Overlay overflow
+///   rows are verified separately and unioned in. Results are returned
+///   in `(doc_id, chunk_ord)` order, capped at `limit`.
 /// * `QueryMode::Regex` and `QueryMode::Fuzzy` return an error — they
 ///   land in the Day-6 milestone.
 pub fn search(
@@ -110,13 +127,19 @@ fn literal_search(state: &IndexState, query: &str, limit: usize) -> Result<Vec<H
     let finder = memmem::Finder::new(needle);
 
     let base = state.load_base();
+    // One read guard, held across base and overflow verification.
+    // The overlay cannot be mutated under us until both passes are
+    // done, so a doc's tombstone and its overflow rows are observed
+    // together — never one without the other.
+    let ov = state.overlay.read();
 
-    // Stage 1: candidate generation via the bigram prefilter.
+    // Stage 1: base candidate generation via the bigram prefilter.
     //
     // `bigrams.query()` returns `Some(bitset)` when at least one of
     // the query's bigrams was tracked. If `None`, the prefilter has
-    // zero information and we must consider every chunk a candidate.
-    let candidates: Option<Vec<u64>> = base
+    // zero information and we must consider every chunk a candidate
+    // (subject to the tombstone check below).
+    let mut candidates: Option<Vec<u64>> = base
         .bigrams
         .as_ref()
         .and_then(|idx| idx.query(needle));
@@ -128,7 +151,23 @@ fn literal_search(state: &IndexState, query: &str, limit: usize) -> Result<Vec<H
         );
     }
 
-    // Stage 2: verification scan.
+    // Stage 2: tombstone mask.
+    // If we have a candidate bitset, clear the tombstoned bits so the
+    // verification loop never even touches stale base chunks. If we
+    // fell through to the full-scan path, the loop checks the
+    // overlay per chunk below — equivalently correct, slightly more
+    // work per iteration.
+    if let Some(ref mut bitset) = candidates {
+        // The query's bitset has exactly `base.bigrams.words()` slots;
+        // the overlay's tombstone vector has `ceil(chunks/64)` slots.
+        // They share a length but we still take the min for safety.
+        let n = bitset.len().min(ov.tombstones.len());
+        for w in 0..n {
+            bitset[w] &= !ov.tombstones[w];
+        }
+    }
+
+    // Stage 3: base verification.
     let mut hits: Vec<Hit> = Vec::new();
     match candidates {
         Some(bitset) => {
@@ -146,7 +185,10 @@ fn literal_search(state: &IndexState, query: &str, limit: usize) -> Result<Vec<H
             }
         }
         None => {
-            for chunk in base.chunks.iter() {
+            for (i, chunk) in base.chunks.iter().enumerate() {
+                if ov.is_tombstoned(i) {
+                    continue;
+                }
                 let Some(pos) = finder.find(&chunk.text_norm_ascii) else {
                     continue;
                 };
@@ -157,6 +199,35 @@ fn literal_search(state: &IndexState, query: &str, limit: usize) -> Result<Vec<H
             }
         }
     }
+
+    // Stage 4: overflow pass.
+    //
+    // The overlay's bigram check uses the same `extract_bigrams`
+    // routine the base index uses on chunks, so a hit against a base
+    // chunk and against its replacement overflow chunk will produce
+    // identical candidate decisions.
+    if hits.len() < limit && !ov.overflow_chunks.is_empty() {
+        let query_bigrams = extract_bigrams(needle);
+        for idx in ov.overflow_matches(&query_bigrams) {
+            let chunk = &ov.overflow_chunks[idx];
+            let Some(pos) = finder.find(&chunk.text_norm_ascii) else {
+                continue;
+            };
+            hits.push(make_hit(chunk, pos, needle.len()));
+            if hits.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    // If both passes contributed, the overflow chunks may be in an
+    // arbitrary order relative to the base chunks. Sort once by
+    // `(doc_id, chunk_ord)` to give the caller a stable shape.
+    // (When only the base pass contributed, the chunks are already
+    // in that order — but the cost of the sort on an `n ≤ limit`
+    // slice is negligible so we always run it for simplicity.)
+    hits.sort_by_key(|h| (h.doc_id, h.page_no, h.chunk_id));
+
     Ok(hits)
 }
 
@@ -382,5 +453,77 @@ mod tests {
         assert_eq!(hits.len(), 1);
         // Snippet must be valid UTF-8 by construction.
         let _ = hits[0].snippet.as_str();
+    }
+
+    #[test]
+    fn tombstoned_base_chunks_are_hidden() {
+        let state = synthetic_state(vec![
+            mk_chunk(1, 1, "/a.pdf", 1, "the quick brown fox"),
+            mk_chunk(2, 2, "/b.pdf", 4, "no match here"),
+            mk_chunk(3, 3, "/c.pdf", 7, "another quick result"),
+        ]);
+        // Tombstone doc 1 — its chunk must disappear from results.
+        {
+            let base = state.load_base();
+            let mut ov = state.overlay.write();
+            ov.tombstone_doc(1, &base);
+        }
+        let hits = search(&state, "quick", QueryMode::Literal, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "/c.pdf");
+    }
+
+    #[test]
+    fn overlay_overflow_chunks_are_searchable() {
+        let state = synthetic_state(vec![mk_chunk(
+            1,
+            1,
+            "/a.pdf",
+            1,
+            "the quick brown fox",
+        )]);
+        // Add an overflow chunk with a distinctive token absent from
+        // the base.
+        {
+            let mut ov = state.overlay.write();
+            ov.add_overflow(mk_chunk(
+                100,
+                2,
+                "/new.pdf",
+                3,
+                "freshly added content with xylotomous",
+            ));
+        }
+        // The base still has "quick".
+        let hits = search(&state, "quick", QueryMode::Literal, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        // The overlay carries the new content.
+        let hits = search(&state, "xylotomous", QueryMode::Literal, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "/new.pdf");
+    }
+
+    #[test]
+    fn modify_doc_swaps_base_for_overflow() {
+        let state = synthetic_state(vec![
+            mk_chunk(1, 1, "/a.pdf", 1, "old version mentions zebra"),
+            mk_chunk(2, 2, "/b.pdf", 1, "second chunk content"),
+        ]);
+        // Replace doc 1's chunks.
+        {
+            let base = state.load_base();
+            let mut ov = state.overlay.write();
+            ov.modify_doc(
+                1,
+                vec![mk_chunk(100, 1, "/a.pdf", 1, "new version mentions giraffe")],
+                &base,
+            );
+        }
+        // "zebra" is gone (the base chunk is tombstoned).
+        let hits = search(&state, "zebra", QueryMode::Literal, 10).unwrap();
+        assert!(hits.is_empty());
+        // "giraffe" appears from the overflow.
+        let hits = search(&state, "giraffe", QueryMode::Literal, 10).unwrap();
+        assert_eq!(hits.len(), 1);
     }
 }

@@ -1,11 +1,13 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use pdffff::app::{IndexOptions, run_index, run_search};
+use pdffff::app::{IndexOptions, WatchOptions, run_index, run_search, run_watch};
 use pdffff::db::Db;
-use pdffff::query::{DISPLAY_LIMIT, QueryMode};
+use pdffff::query::{DISPLAY_LIMIT, QueryMode, search};
 use pdffff::scanner::Scanner;
 
 #[derive(Parser, Debug)]
@@ -46,6 +48,28 @@ enum Command {
         /// Override extractor pool size. Default: min(num_cpus, 6).
         #[arg(long)]
         jobs: Option<usize>,
+    },
+    /// Long-lived watch mode: synchronous scan + extract pass to
+    /// converge with disk, then a notify-based watcher that keeps the
+    /// in-memory index live. Type queries on stdin and the process
+    /// answers them against the current snapshot. Press Ctrl-C (or
+    /// close stdin) to exit cleanly.
+    Watch {
+        /// Directory to watch recursively.
+        root: PathBuf,
+        /// Respect .gitignore / .ignore files.
+        #[arg(long)]
+        respect_ignore: bool,
+        /// Follow symlinks.
+        #[arg(long)]
+        follow_symlinks: bool,
+        /// Override extractor pool size. Default: min(num_cpus, 6).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Watcher debounce window in milliseconds. Default: 200 ms
+        /// (inside the 50–250 ms band from the report).
+        #[arg(long)]
+        debounce_ms: Option<u64>,
     },
     /// Search the indexed corpus for a literal query. Requires that
     /// `pdffff index` has been run first.
@@ -99,6 +123,13 @@ fn main() -> Result<()> {
             follow_symlinks,
             jobs,
         } => cmd_index(&cli.db, &root, respect_ignore, follow_symlinks, jobs),
+        Command::Watch {
+            root,
+            respect_ignore,
+            follow_symlinks,
+            jobs,
+            debounce_ms,
+        } => cmd_watch(&cli.db, &root, respect_ignore, follow_symlinks, jobs, debounce_ms),
         Command::Search { query, mode, limit } => cmd_search(&cli.db, &query, mode, limit),
         Command::Info => cmd_info(&cli.db),
     }
@@ -166,6 +197,70 @@ fn cmd_index(
         stats.deleted,
         stats.elapsed_secs,
     );
+    Ok(())
+}
+
+fn cmd_watch(
+    db_path: &PathBuf,
+    root: &PathBuf,
+    respect_ignore: bool,
+    follow_symlinks: bool,
+    jobs: Option<usize>,
+    debounce_ms: Option<u64>,
+) -> Result<()> {
+    let opts = WatchOptions {
+        respect_gitignore: respect_ignore,
+        follow_symlinks,
+        jobs,
+        require_pdftotext: true,
+        debounce: debounce_ms.map(Duration::from_millis),
+    };
+    let handle = run_watch(db_path, root, &opts)?;
+    println!(
+        "watching {} (debounce {} ms). type a literal query and press enter; empty line or EOF to quit.",
+        root.display(),
+        debounce_ms.unwrap_or(200),
+    );
+    let state: Arc<pdffff::index::IndexState> = handle.state.clone();
+
+    // Read queries from stdin until EOF / blank line. Each query
+    // runs against the *current* snapshot so the user can observe
+    // the watcher updating the index live.
+    use std::io::{BufRead, Write};
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    let mut line = String::new();
+    loop {
+        write!(stdout, "> ")?;
+        stdout.flush()?;
+        line.clear();
+        let n = match stdin.lock().read_line(&mut line) {
+            Ok(n) => n,
+            Err(err) => {
+                eprintln!("stdin error: {err}");
+                break;
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        let q = line.trim();
+        if q.is_empty() {
+            break;
+        }
+        match search(&state, q, QueryMode::Literal, DISPLAY_LIMIT) {
+            Ok(hits) => {
+                if hits.is_empty() {
+                    println!("(no hits)");
+                }
+                for hit in &hits {
+                    println!("{}:{}  {}", hit.path, hit.page_no, hit.snippet);
+                }
+            }
+            Err(err) => eprintln!("query error: {err}"),
+        }
+    }
+    handle.stop()?;
     Ok(())
 }
 

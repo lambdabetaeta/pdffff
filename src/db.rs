@@ -337,6 +337,45 @@ impl Db {
         Ok(doc_id)
     }
 
+    /// Load every active chunk for a single doc, in `chunk_ord` order.
+    ///
+    /// Used by the live watch pipeline to convert a freshly-UPSERTed
+    /// `ExtractedDoc` into the `ChunkItem` rows the overlay needs.
+    /// Returns the rows together with the `doc_id` and current
+    /// `mtime_ns` so the overlay can construct `ChunkItem`s with the
+    /// same identity the base loader would have produced.
+    pub fn load_chunks_for_doc(&self, doc_id: i64) -> Result<Vec<LoadedChunkRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.chunk_id, c.doc_id, d.path, d.mtime_ns, c.page_no, c.chunk_ord, \
+                    c.char_start, c.char_end, c.text_utf8, c.text_norm_ascii, c.preview \
+             FROM chunks c \
+             JOIN documents d ON d.doc_id = c.doc_id \
+             WHERE c.active = 1 AND c.doc_id = ?1 \
+             ORDER BY c.chunk_ord",
+        )?;
+        let rows = stmt.query_map(params![doc_id], |row| {
+            let path_str: String = row.get(2)?;
+            Ok(LoadedChunkRow {
+                chunk_id: row.get(0)?,
+                doc_id: row.get(1)?,
+                path: PathBuf::from(path_str),
+                doc_mtime_ns: row.get(3)?,
+                page_no: row.get::<_, i64>(4)? as u32,
+                chunk_ord: row.get::<_, i64>(5)? as u32,
+                char_start: row.get::<_, i64>(6)? as u32,
+                char_end: row.get::<_, i64>(7)? as u32,
+                text_utf8: row.get(8)?,
+                text_norm_ascii: row.get(9)?,
+                preview: row.get(10)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// Mark a path as deleted. Also tombstones its chunks (deletes them
     /// via FK cascade is fine, but we keep them and just deactivate so an
     /// undo is easy).
