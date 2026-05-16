@@ -24,6 +24,8 @@ use tracing::{info, warn};
 
 use crate::db::{Db, DocStatus, ExtractedDoc};
 use crate::extract::{ensure_pdftotext_available, extract_pdf, probe_pdftotext_or_explain};
+use crate::index::{IndexState, load_base_index_from_db};
+use crate::query::{Hit, QueryMode, search};
 use crate::scanner::{ScanJob, Scanner};
 
 /// Wall-clock milliseconds since the Unix epoch. Used as `indexed_at_ms`
@@ -164,6 +166,22 @@ pub fn run_index(db_path: &Path, root: &Path, opts: &IndexOptions) -> Result<Ind
         deleted: counters.deleted.load(Ordering::Relaxed),
         elapsed_secs: started.elapsed().as_secs_f64(),
     })
+}
+
+/// One-shot search: open the DB, load the base index, run a literal
+/// query, return the hits. Day 3 keeps this synchronous — there is no
+/// watcher, rebuild loop, or persistent process yet.
+pub fn run_search(
+    db_path: &Path,
+    query: &str,
+    mode: QueryMode,
+    limit: usize,
+) -> Result<Vec<Hit>> {
+    let db = Db::open_reader(db_path)
+        .with_context(|| format!("opening DB at {} for search", db_path.display()))?;
+    let base = load_base_index_from_db(&db)?;
+    let state = IndexState::new(base);
+    search(&state, query, mode, limit)
 }
 
 fn default_pool_size() -> usize {

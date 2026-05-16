@@ -1,10 +1,11 @@
-use anyhow::Result;
-use clap::{Parser, Subcommand};
+use anyhow::{Result, bail};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use pdffff::app::{IndexOptions, run_index};
+use pdffff::app::{IndexOptions, run_index, run_search};
 use pdffff::db::Db;
+use pdffff::query::{DISPLAY_LIMIT, QueryMode};
 use pdffff::scanner::Scanner;
 
 #[derive(Parser, Debug)]
@@ -46,8 +47,39 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Search the indexed corpus for a literal query. Requires that
+    /// `pdffff index` has been run first.
+    Search {
+        /// Query string. Normalized through the same ASCII / lowercase
+        /// pipeline used at index time.
+        query: String,
+        /// Query engine: only `literal` works today. `regex` and
+        /// `fuzzy` ship on Day 6.
+        #[arg(long, value_enum, default_value_t = CliQueryMode::Literal)]
+        mode: CliQueryMode,
+        /// Cap on number of hits to print.
+        #[arg(long, default_value_t = DISPLAY_LIMIT)]
+        limit: usize,
+    },
     /// Show database statistics.
     Info,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum CliQueryMode {
+    Literal,
+    Regex,
+    Fuzzy,
+}
+
+impl CliQueryMode {
+    fn to_query_mode(self) -> QueryMode {
+        match self {
+            CliQueryMode::Literal => QueryMode::Literal,
+            CliQueryMode::Regex => QueryMode::Regex,
+            CliQueryMode::Fuzzy => QueryMode::Fuzzy,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -67,8 +99,26 @@ fn main() -> Result<()> {
             follow_symlinks,
             jobs,
         } => cmd_index(&cli.db, &root, respect_ignore, follow_symlinks, jobs),
+        Command::Search { query, mode, limit } => cmd_search(&cli.db, &query, mode, limit),
         Command::Info => cmd_info(&cli.db),
     }
+}
+
+fn cmd_search(db_path: &PathBuf, query: &str, mode: CliQueryMode, limit: usize) -> Result<()> {
+    match mode {
+        CliQueryMode::Literal => {}
+        CliQueryMode::Regex | CliQueryMode::Fuzzy => {
+            // We could let `run_search` produce this error, but giving
+            // the message at the CLI boundary makes the day-by-day
+            // status explicit to users.
+            bail!("--mode {mode:?} is not implemented yet (planned for day 6)");
+        }
+    }
+    let hits = run_search(db_path, query, mode.to_query_mode(), limit)?;
+    for hit in &hits {
+        println!("{}:{}  {}", hit.path, hit.page_no, hit.snippet);
+    }
+    Ok(())
 }
 
 fn cmd_scan(db_path: &PathBuf, root: &PathBuf, respect_ignore: bool, follow_symlinks: bool) -> Result<()> {

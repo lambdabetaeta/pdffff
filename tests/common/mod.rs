@@ -5,6 +5,13 @@
 //! resulting PDFs are saved to a tempdir, then fed through the real
 //! `pdftotext` binary by the extractor pipeline — i.e., this is an
 //! end-to-end test, not a unit test.
+//!
+//! This module is included by multiple integration-test binaries; each
+//! binary uses a subset of its helpers, so `#[allow(dead_code)]` here
+//! suppresses spurious unused-symbol warnings from the binaries that
+//! don't need every fixture.
+
+#![allow(dead_code)]
 
 use std::fs::File;
 use std::io::BufWriter;
