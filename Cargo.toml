@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Durable, fast PDF folder search via pdftotext + SQLite + in-memory bigram index"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/user/pdffff"
+readme = "README.md"
+keywords = ["pdf", "search", "fulltext", "fuzzy"]
+categories = ["command-line-utilities", "text-processing"]
 
 [[bin]]
 name = "pdffff"
@@ -47,6 +51,9 @@ blake3 = "1"
 clap   = { version = "4", features = ["derive"] }
 anyhow = "1"
 thiserror = "2"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+owo-colors = "4"
 
 # Logging
 tracing            = "0.1"
@@ -56,8 +63,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 humantime = "2"
 
 [dev-dependencies]
-tempfile = "3"
-printpdf = "0.7"
+tempfile    = "3"
+printpdf    = "0.7"
+criterion   = "0.5"
+rand_chacha = "0.3"
+rand        = "0.8"
+
+[[bench]]
+name = "literal_search"
+harness = false
+
+[[bench]]
+name = "bigram_build"
+harness = false
 
 [profile.release]
 lto = "thin"

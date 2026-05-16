@@ -8,7 +8,7 @@
 //!    `BigramIndex::query`; for regex / fuzzy we go through
 //!    [`crate::bigram_query::regex_to_bigram_query`] /
 //!    [`crate::bigram_query::fuzzy_to_bigram_query`] and evaluate the
-//!    resulting [`BigramQuery`] AND/OR tree. When the prefilter has no
+//!    resulting [`crate::bigram_query::BigramQuery`] AND/OR tree. When the prefilter has no
 //!    information (the bigram set is empty, every column was dropped,
 //!    or the query is `Any`) the candidate set is "every active chunk".
 //! 2. **Tombstone mask.** If the overlay has tombstoned base chunks we
@@ -61,7 +61,7 @@ use crate::normalize::normalize_query_ascii;
 pub const DISPLAY_LIMIT: usize = 200;
 
 /// Number of evenly-spaced probe bigrams to take when decomposing a
-/// fuzzy query into a [`BigramQuery`]. The report names six.
+/// fuzzy query into a [`crate::bigram_query::BigramQuery`]. The report names six.
 pub const FUZZY_PROBES: usize = 6;
 
 /// Above this many candidate chunks we skip neo_frizbee and fall back
@@ -92,12 +92,18 @@ pub enum QueryMode {
 }
 
 /// One search result, ready to format for the CLI.
-#[derive(Debug, Clone)]
+///
+/// Implements [`serde::Serialize`] so the CLI's `--json` mode can emit
+/// one compact JSON object per hit. The field names are stable and
+/// match the user-facing column names (`path`, `page_no`, `chunk_ord`,
+/// `score`, `snippet`).
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Hit {
     pub chunk_id: i64,
     pub doc_id: i64,
     pub path: String,
     pub page_no: u32,
+    pub chunk_ord: u32,
     pub score: f32,
     pub snippet: String,
 }
@@ -455,6 +461,7 @@ fn make_hit_at_norm(chunk: &ChunkItem, match_offset_in_norm: usize, query_len: u
         doc_id: chunk.doc_id,
         path: chunk.path.to_string(),
         page_no: chunk.page_no,
+        chunk_ord: chunk.chunk_ord,
         score: 1.0,
         snippet: render_snippet(chunk, match_offset_in_norm, query_len),
     }
@@ -469,6 +476,7 @@ fn make_hit_at_utf8(chunk: &ChunkItem, match_offset_in_utf8: usize, query_len: u
         doc_id: chunk.doc_id,
         path: chunk.path.to_string(),
         page_no: chunk.page_no,
+        chunk_ord: chunk.chunk_ord,
         score: 1.0,
         snippet: render_snippet_at_utf8(chunk, match_offset_in_utf8, query_len),
     }
@@ -860,6 +868,7 @@ mod tests {
                 doc_id: 1,
                 path: "/a.pdf".into(),
                 page_no: 9,
+                chunk_ord: 0,
                 score: 1.0,
                 snippet: "foo lonely word here bar".into(),
             },
@@ -868,6 +877,7 @@ mod tests {
                 doc_id: 2,
                 path: "/b.pdf".into(),
                 page_no: 1,
+                chunk_ord: 0,
                 score: 1.0,
                 snippet: "this contains foo bar exactly".into(),
             },
@@ -876,6 +886,7 @@ mod tests {
                 doc_id: 3,
                 path: "/c.pdf".into(),
                 page_no: 4,
+                chunk_ord: 0,
                 score: 1.0,
                 snippet: "neither here nor there".into(),
             },
@@ -894,6 +905,7 @@ mod tests {
                 doc_id: 1,
                 path: "/a.pdf".into(),
                 page_no: 3,
+                chunk_ord: 0,
                 score: 1.0,
                 snippet: "matches nothing distinctive".into(),
             },
@@ -902,6 +914,7 @@ mod tests {
                 doc_id: 2,
                 path: "/b.pdf".into(),
                 page_no: 1,
+                chunk_ord: 0,
                 score: 1.0,
                 snippet: "matches nothing distinctive".into(),
             },

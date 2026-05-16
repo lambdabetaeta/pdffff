@@ -1,13 +1,23 @@
-use anyhow::Result;
+//! pdffff command-line entry point.
+//!
+//! Every subcommand is a thin wrapper around a function in
+//! [`pdffff::app`] so the same building blocks can be exercised from
+//! tests, benchmarks, and the binary. Result printing lives here (and
+//! only here): the library never writes to stdout itself.
+
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use std::path::PathBuf;
+use owo_colors::OwoColorize;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use pdffff::app::{IndexOptions, WatchOptions, run_index, run_rebuild, run_search, run_watch};
 use pdffff::db::Db;
-use pdffff::query::{DISPLAY_LIMIT, QueryMode, search};
+use pdffff::extract::{ensure_pdftotext_available, extractor_version_or_missing};
+use pdffff::query::{DISPLAY_LIMIT, Hit, QueryMode, search};
 use pdffff::scanner::Scanner;
 
 #[derive(Parser, Debug)]
@@ -23,7 +33,10 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Walk a directory and report the diff against the database (dry run).
+    /// Dry-run scanner: walks a directory and reports what would be indexed.
+    ///
+    /// Useful to check `.gitignore` interactions or symlink handling
+    /// before committing to a long extraction run.
     Scan {
         /// Directory to walk recursively.
         root: PathBuf,
@@ -34,7 +47,9 @@ enum Command {
         #[arg(long)]
         follow_symlinks: bool,
     },
-    /// Scan, extract every dirty PDF with a worker pool, and persist
+    /// Index a directory of PDFs into SQLite (one-shot).
+    ///
+    /// Scans, extracts every dirty PDF with a worker pool, and persists
     /// chunks to SQLite. Tombstones any paths that disappeared from disk.
     Index {
         /// Directory to walk recursively.
@@ -49,6 +64,8 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Watch a folder for changes and answer interactive queries.
+    ///
     /// Long-lived watch mode: synchronous scan + extract pass to
     /// converge with disk, then a notify-based watcher that keeps the
     /// in-memory index live. Type queries on stdin and the process
@@ -67,11 +84,16 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
         /// Watcher debounce window in milliseconds. Default: 200 ms
-        /// (inside the 50–250 ms band from the report).
+        /// (inside the 50-250 ms band from the report).
         #[arg(long)]
         debounce_ms: Option<u64>,
     },
-    /// Search the indexed corpus. Three modes are supported.
+    /// Search the indexed corpus.
+    ///
+    /// Three modes are supported: literal (the default), regex, and
+    /// fuzzy.  Results are printed one per blank-separated paragraph
+    /// with path, page, chunk number, score, and a match-centred
+    /// snippet — or, with `--json`, one compact JSON object per line.
     Search {
         /// Query string. For literal/fuzzy the query is normalized
         /// through the same ASCII / lowercase pipeline used at index
@@ -86,15 +108,31 @@ enum Command {
         /// Cap on number of hits to print.
         #[arg(long, default_value_t = DISPLAY_LIMIT)]
         limit: usize,
+        /// Emit one compact JSON object per hit on stdout, one per
+        /// line. Suitable for piping to `jq` / xargs / other scripts.
+        #[arg(long)]
+        json: bool,
     },
-    /// Force a rebuild of the in-memory base index from SQLite and
-    /// print the resulting stats. Useful for diagnostics and for
-    /// validating that an extracted corpus survives a round-trip. The
-    /// long-lived `watch` mode triggers rebuilds automatically when
-    /// the overlay exceeds its thresholds.
+    /// Force a base-index rebuild from SQLite and report stats.
+    ///
+    /// Useful for diagnostics and for validating that an extracted
+    /// corpus survives a round-trip. The long-lived `watch` mode
+    /// triggers rebuilds automatically when the overlay exceeds its
+    /// thresholds.
     Rebuild,
-    /// Show database statistics.
+    /// Print database statistics (one-shot).
+    ///
+    /// Reports total documents broken down by status, total active
+    /// chunks, and the approximate memory cost of the in-memory bigram
+    /// prefilter that would be built at startup.
     Info,
+    /// Diagnose the install / database / corpus end-to-end.
+    ///
+    /// Verifies `pdftotext` is available and reports its version,
+    /// asks SQLite for an integrity check, summarises document
+    /// statuses, and lists up to 20 documents currently in
+    /// `status='error'` along with their stored `error_text`.
+    Diagnose,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -138,18 +176,144 @@ fn main() -> Result<()> {
             jobs,
             debounce_ms,
         } => cmd_watch(&cli.db, &root, respect_ignore, follow_symlinks, jobs, debounce_ms),
-        Command::Search { query, mode, limit } => cmd_search(&cli.db, &query, mode, limit),
+        Command::Search {
+            query,
+            mode,
+            limit,
+            json,
+        } => cmd_search(&cli.db, &query, mode, limit, json),
         Command::Rebuild => cmd_rebuild(&cli.db),
         Command::Info => cmd_info(&cli.db),
+        Command::Diagnose => cmd_diagnose(&cli.db),
     }
 }
 
-fn cmd_search(db_path: &PathBuf, query: &str, mode: CliQueryMode, limit: usize) -> Result<()> {
+/// True iff stdout is a real terminal and `NO_COLOR` is not set.
+fn use_color() -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    std::io::stdout().is_terminal()
+}
+
+fn cmd_search(
+    db_path: &PathBuf,
+    query: &str,
+    mode: CliQueryMode,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
     let hits = run_search(db_path, query, mode.to_query_mode(), limit)?;
-    for hit in &hits {
-        println!("{}:{}  {}", hit.path, hit.page_no, hit.snippet);
+    if json {
+        let mut stdout = std::io::stdout().lock();
+        for hit in &hits {
+            serde_json::to_writer(&mut stdout, hit)
+                .context("writing JSON hit to stdout")?;
+            std::io::Write::write_all(&mut stdout, b"\n")?;
+        }
+    } else {
+        print_hits_human(&hits, query, use_color());
     }
     Ok(())
+}
+
+/// Render hits in the human-readable format described in Day 7's brief:
+///
+/// ```text
+/// {n}. {path} (page {page_no}, chunk #{chunk_ord}, score {score:.2})
+///      {snippet}
+/// ```
+///
+/// When `colored` is true, the filename is bold and the page-number
+/// metadata is dim; inside the snippet the normalised query phrase
+/// (and each of its whitespace-split terms) is rendered with inverse
+/// video so the matched substring stands out.
+fn print_hits_human(hits: &[Hit], query: &str, colored: bool) {
+    for (i, hit) in hits.iter().enumerate() {
+        let header_path: String = if colored {
+            hit.path.bold().to_string()
+        } else {
+            hit.path.clone()
+        };
+        let metadata = format!(
+            "(page {}, chunk #{}, score {:.2})",
+            hit.page_no, hit.chunk_ord, hit.score,
+        );
+        let metadata: String = if colored {
+            metadata.dimmed().to_string()
+        } else {
+            metadata
+        };
+        println!("{}. {} {}", i + 1, header_path, metadata);
+        let snippet_line = if colored {
+            highlight_snippet(&hit.snippet, query)
+        } else {
+            hit.snippet.clone()
+        };
+        println!("     {snippet_line}");
+        println!();
+    }
+}
+
+/// Wrap occurrences of `query` (or its whitespace-split terms) in
+/// `owo_colors` reverse-video escapes. Case-insensitive; non-overlapping
+/// from left to right; the longest token wins at each starting position
+/// (so the full phrase, if present, takes precedence over a single term).
+fn highlight_snippet(snippet: &str, query: &str) -> String {
+    let phrase = query.trim().to_lowercase();
+    let mut needles: Vec<String> = if phrase.is_empty() {
+        Vec::new()
+    } else {
+        let mut v = vec![phrase.clone()];
+        v.extend(
+            phrase
+                .split_whitespace()
+                .filter(|t| *t != phrase)
+                .map(|t| t.to_lowercase()),
+        );
+        v
+    };
+    // Longest first so the phrase wins over its constituent terms.
+    needles.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    needles.dedup();
+    if needles.is_empty() {
+        return snippet.to_string();
+    }
+    let snippet_lc = snippet.to_lowercase();
+    let bytes = snippet.as_bytes();
+    let lc_bytes = snippet_lc.as_bytes();
+    let mut out = String::with_capacity(snippet.len() + 16);
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        // Skip past any byte boundary inside a multi-byte char.
+        if !snippet.is_char_boundary(cursor) {
+            out.push(snippet[cursor..].chars().next().unwrap());
+            cursor += snippet[cursor..].chars().next().unwrap().len_utf8();
+            continue;
+        }
+        let mut matched: Option<&str> = None;
+        for n in &needles {
+            if cursor + n.len() <= bytes.len() && &lc_bytes[cursor..cursor + n.len()] == n.as_bytes()
+            {
+                // Must still be a char boundary on both sides.
+                if snippet.is_char_boundary(cursor + n.len()) {
+                    matched = Some(n);
+                    break;
+                }
+            }
+        }
+        if let Some(n) = matched {
+            let end = cursor + n.len();
+            let original = &snippet[cursor..end];
+            out.push_str(&original.reversed().to_string());
+            cursor = end;
+        } else {
+            let ch = snippet[cursor..].chars().next().unwrap();
+            out.push(ch);
+            cursor += ch.len_utf8();
+        }
+    }
+    out
 }
 
 fn cmd_rebuild(db_path: &PathBuf) -> Result<()> {
@@ -231,10 +395,8 @@ fn cmd_watch(
         debounce_ms.unwrap_or(200),
     );
     let state: Arc<pdffff::index::IndexState> = handle.state.clone();
+    let colored = use_color();
 
-    // Read queries from stdin until EOF / blank line. Each query
-    // runs against the *current* snapshot so the user can observe
-    // the watcher updating the index live.
     use std::io::{BufRead, Write};
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -261,9 +423,8 @@ fn cmd_watch(
             Ok(hits) => {
                 if hits.is_empty() {
                     println!("(no hits)");
-                }
-                for hit in &hits {
-                    println!("{}:{}  {}", hit.path, hit.page_no, hit.snippet);
+                } else {
+                    print_hits_human(&hits, q, colored);
                 }
             }
             Err(err) => eprintln!("query error: {err}"),
@@ -285,5 +446,83 @@ fn cmd_info(db_path: &PathBuf) -> Result<()> {
     println!("  empty:   {empty}");
     println!("  error:   {errors}");
     println!("  deleted: {deleted}");
+
+    // Load the base index purely to report chunk count and bigram heap
+    // size. This is the same load `run_search` would do, so the
+    // reported numbers are the ones a real query would face.
+    let base = pdffff::index::load_base_index_from_db(&db)?;
+    let bigram_bytes = base.bigrams.as_ref().map_or(0, |b| b.heap_bytes());
+    let bigram_mib = bigram_bytes as f64 / (1024.0 * 1024.0);
+    println!("chunks:    {} active", base.chunks.len());
+    println!("bigram heap: {bigram_bytes} bytes ({bigram_mib:.2} MiB)");
+    Ok(())
+}
+
+fn cmd_diagnose(db_path: &PathBuf) -> Result<()> {
+    println!("== pdftotext ==");
+    match ensure_pdftotext_available() {
+        Ok(()) => {
+            let v = extractor_version_or_missing();
+            println!("  ok: {v}");
+        }
+        Err(err) => println!("  MISSING: {err}"),
+    }
+
+    println!("\n== sqlite ==");
+    diagnose_db(db_path)?;
+    Ok(())
+}
+
+fn diagnose_db(db_path: &Path) -> Result<()> {
+    if !db_path.exists() {
+        println!("  database file does not exist: {}", db_path.display());
+        return Ok(());
+    }
+    let db = Db::open_reader(db_path)?;
+    let integrity: String = db
+        .conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .context("running PRAGMA integrity_check")?;
+    println!("  integrity_check: {integrity}");
+
+    let docs = db.load_all_documents()?;
+    let mut counts = [0usize; 4]; // ok, empty, error, deleted
+    for d in &docs {
+        let i = match d.status {
+            pdffff::db::DocStatus::Ok => 0,
+            pdffff::db::DocStatus::Empty => 1,
+            pdffff::db::DocStatus::Error => 2,
+            pdffff::db::DocStatus::Deleted => 3,
+        };
+        counts[i] += 1;
+    }
+    println!("  documents: {} total", docs.len());
+    println!("    ok:      {}", counts[0]);
+    println!("    empty:   {}", counts[1]);
+    println!("    error:   {}", counts[2]);
+    println!("    deleted: {}", counts[3]);
+
+    if counts[2] > 0 {
+        println!("\n== errored documents (up to 20) ==");
+        let mut stmt = db.conn.prepare(
+            "SELECT path, error_text FROM documents \
+             WHERE status = 'error' \
+             ORDER BY indexed_at_ms DESC \
+             LIMIT 20",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let path: String = r.get(0)?;
+            let err: Option<String> = r.get(1)?;
+            Ok((path, err))
+        })?;
+        for row in rows {
+            let (path, err) = row?;
+            println!(
+                "  {} :: {}",
+                path,
+                err.unwrap_or_else(|| "(no error_text)".to_string()),
+            );
+        }
+    }
     Ok(())
 }

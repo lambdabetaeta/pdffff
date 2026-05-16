@@ -364,6 +364,13 @@ fn make_preview(text: &str) -> String {
     out
 }
 
+/// Return the first line of `pdftotext -v` output, or the string
+/// `"missing"` if the binary is not on PATH / refused to run. Used by
+/// `pdffff diagnose` to surface the installed poppler version.
+pub fn extractor_version_or_missing() -> String {
+    crate::db::extractor_version()
+}
+
 /// Sanity check: returns `Err` if `pdftotext` is on PATH but appears
 /// unusable. Used at startup of the `index` subcommand.
 pub fn probe_pdftotext_or_explain() -> Result<()> {
