@@ -1,0 +1,64 @@
+[package]
+name = "pdffff"
+version = "0.1.0"
+edition = "2021"
+description = "Durable, fast PDF folder search via pdftotext + SQLite + in-memory bigram index"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "pdffff"
+path = "src/main.rs"
+
+[lib]
+name = "pdffff"
+path = "src/lib.rs"
+
+[dependencies]
+# Durable store
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Concurrency primitives
+arc-swap   = "1.7"
+parking_lot = "0.12"
+flume      = "0.11"
+rayon      = "1.10"
+
+# Filesystem
+ignore                = "0.4"
+notify                = "8"
+notify-debouncer-full = "0.5"
+
+# Pattern matching
+regex        = "1"
+regex-syntax = "0.8"
+memchr       = "2"
+aho-corasick = "1"
+
+# Normalization
+deunicode = "1"
+
+# Fuzzy scoring (the scorer fff uses)
+neo_frizbee = "0.10"
+
+# Hashing for content signatures (optional but the report names it)
+blake3 = "1"
+
+# CLI / output
+clap   = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time / printing
+humantime = "2"
+
+[dev-dependencies]
+tempfile = "3"
+printpdf = "0.7"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
