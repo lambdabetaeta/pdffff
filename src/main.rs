@@ -1,11 +1,11 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use pdffff::app::{IndexOptions, WatchOptions, run_index, run_search, run_watch};
+use pdffff::app::{IndexOptions, WatchOptions, run_index, run_rebuild, run_search, run_watch};
 use pdffff::db::Db;
 use pdffff::query::{DISPLAY_LIMIT, QueryMode, search};
 use pdffff::scanner::Scanner;
@@ -71,20 +71,28 @@ enum Command {
         #[arg(long)]
         debounce_ms: Option<u64>,
     },
-    /// Search the indexed corpus for a literal query. Requires that
-    /// `pdffff index` has been run first.
+    /// Search the indexed corpus. Three modes are supported.
     Search {
-        /// Query string. Normalized through the same ASCII / lowercase
-        /// pipeline used at index time.
+        /// Query string. For literal/fuzzy the query is normalized
+        /// through the same ASCII / lowercase pipeline used at index
+        /// time. For regex the pattern is passed through verbatim —
+        /// case-insensitivity is handled by the regex engine so that
+        /// the bigram prefilter's lowercase-only assumption stays
+        /// consistent with what the verifier sees.
         query: String,
-        /// Query engine: only `literal` works today. `regex` and
-        /// `fuzzy` ship on Day 6.
+        /// Query engine.
         #[arg(long, value_enum, default_value_t = CliQueryMode::Literal)]
         mode: CliQueryMode,
         /// Cap on number of hits to print.
         #[arg(long, default_value_t = DISPLAY_LIMIT)]
         limit: usize,
     },
+    /// Force a rebuild of the in-memory base index from SQLite and
+    /// print the resulting stats. Useful for diagnostics and for
+    /// validating that an extracted corpus survives a round-trip. The
+    /// long-lived `watch` mode triggers rebuilds automatically when
+    /// the overlay exceeds its thresholds.
+    Rebuild,
     /// Show database statistics.
     Info,
 }
@@ -131,24 +139,25 @@ fn main() -> Result<()> {
             debounce_ms,
         } => cmd_watch(&cli.db, &root, respect_ignore, follow_symlinks, jobs, debounce_ms),
         Command::Search { query, mode, limit } => cmd_search(&cli.db, &query, mode, limit),
+        Command::Rebuild => cmd_rebuild(&cli.db),
         Command::Info => cmd_info(&cli.db),
     }
 }
 
 fn cmd_search(db_path: &PathBuf, query: &str, mode: CliQueryMode, limit: usize) -> Result<()> {
-    match mode {
-        CliQueryMode::Literal => {}
-        CliQueryMode::Regex | CliQueryMode::Fuzzy => {
-            // We could let `run_search` produce this error, but giving
-            // the message at the CLI boundary makes the day-by-day
-            // status explicit to users.
-            bail!("--mode {mode:?} is not implemented yet (planned for day 6)");
-        }
-    }
     let hits = run_search(db_path, query, mode.to_query_mode(), limit)?;
     for hit in &hits {
         println!("{}:{}  {}", hit.path, hit.page_no, hit.snippet);
     }
+    Ok(())
+}
+
+fn cmd_rebuild(db_path: &PathBuf) -> Result<()> {
+    let stats = run_rebuild(db_path)?;
+    println!(
+        "rebuild: docs={} chunks={} bigram_bytes={} elapsed={:.2}s",
+        stats.docs, stats.chunks, stats.bigram_heap_bytes, stats.elapsed_secs,
+    );
     Ok(())
 }
 

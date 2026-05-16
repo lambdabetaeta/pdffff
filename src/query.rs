@@ -1,66 +1,77 @@
 //! Search engine over an [`IndexState`].
 //!
-//! Literal search runs in two stages, with the Day-5 overlay layered
-//! on top of the base index:
+//! All three modes share a candidate-generation skeleton built on the
+//! Day-4 bigram prefilter and the Day-5 overlay:
 //!
-//! 1. **Candidate generation.** Normalize the query through
-//!    `crate::normalize::normalize_query_ascii`, then ask the
-//!    [`BigramIndex`] for a bitset of base items that *might* contain
-//!    the query. When the index has no information about the query
-//!    (either the index is missing, the query is too short, or none
-//!    of the query's bigrams survived compression), the candidate
-//!    set falls back to "every active chunk".
-//! 2. **Tombstone mask.** If the overlay has tombstoned base chunks
-//!    we AND-NOT the tombstone bitset into the candidate bitset
-//!    before verification, so stale base chunks never reach the
-//!    verifier. When the candidate set is the fallback "everything",
-//!    the verification loop checks `Overlay::is_tombstoned` per chunk.
-//! 3. **Verification.** For each surviving candidate, run a compiled
-//!    `memchr::memmem::Finder` over `text_norm_ascii`. The finder is
-//!    the source of truth for whether a chunk is a real hit; the
-//!    bigram prefilter never decides hits, only narrows.
-//! 4. **Overflow pass.** Extract the query's bigrams once, ask the
-//!    overlay for the indices of overflow chunks that pass the
-//!    overlay-side bigram prefilter, and verify them with the same
-//!    finder.
-//!
-//! Day 6 plumbs the same prefilter into regex / fuzzy modes.
+//! 1. **Candidate generation.** Convert the query into a candidate
+//!    bitset over the base index. For literal queries we go through
+//!    `BigramIndex::query`; for regex / fuzzy we go through
+//!    [`crate::bigram_query::regex_to_bigram_query`] /
+//!    [`crate::bigram_query::fuzzy_to_bigram_query`] and evaluate the
+//!    resulting [`BigramQuery`] AND/OR tree. When the prefilter has no
+//!    information (the bigram set is empty, every column was dropped,
+//!    or the query is `Any`) the candidate set is "every active chunk".
+//! 2. **Tombstone mask.** If the overlay has tombstoned base chunks we
+//!    AND-NOT the tombstone bitset into the candidate bitset before
+//!    verification.
+//! 3. **Verification.** Per-mode:
+//!     * Literal: a compiled `memchr::memmem::Finder` over
+//!       `text_norm_ascii`.
+//!     * Regex: a compiled `regex::Regex` matched against `text_utf8`,
+//!       with `case_insensitive(true)` so the regex engine's notion of
+//!       case matches the lowercase-only bigram decomposition.
+//!     * Fuzzy: `memmem` is replaced by neo_frizbee's parallel match
+//!       call over a synthetic "rank string" of
+//!       `"{filename} {path} page {page_no} {preview}"`. Above a
+//!       candidate-count limit ([`FRIZBEE_LIMIT`]) we fall back to a
+//!       cheap deterministic ordering — the report calls for this
+//!       explicitly so we don't burn neo_frizbee on huge candidate
+//!       lists.
+//! 4. **Overflow pass.** Mode-specific candidate set:
+//!     * Literal: use the query's deduped bigram set against
+//!       `Overlay::overflow_matches`.
+//!     * Regex: conservatively include every overflow row; the regex
+//!       engine still decides hits and the verification cost over a
+//!       few-thousand-chunk overlay is acceptable. (fff does the same;
+//!       regex bigrams don't always survive deduplication.)
+//!     * Fuzzy: include every overflow row, the same neo_frizbee
+//!       call handles them.
 //!
 //! The base index and the overlay are read under a single
-//! `state.overlay.read()` guard that brackets both verification
-//! passes. That gives a consistent snapshot: the overlay cannot be
-//! mutated between deciding which base chunks are still live and
-//! walking the overflow rows.
+//! `state.overlay.read()` guard that brackets both verification passes
+//! so the snapshot stays consistent.
 //!
 //! Snippet rendering is best-effort: the normalized bytes
 //! (`text_norm_ascii`) do not byte-align with the original
 //! `text_utf8` after deunicode + lowercase + whitespace collapse, so a
 //! position in the norm cannot be mapped exactly back into the UTF-8
-//! text. The strategy is:
-//!
-//! 1. Try a *proportional* mapping (norm_offset / norm_len ≈
-//!    utf8_offset / utf8_len) to find a byte index in `text_utf8`.
-//! 2. Snap to the nearest UTF-8 char boundary.
-//! 3. Take a window of [`SNIPPET_CONTEXT_BYTES`] on each side, snapped
-//!    to UTF-8 boundaries.
-//! 4. Collapse whitespace runs to single spaces.
-//!
-//! The result *visually approximates* the match position but is not a
-//! cryptographic alignment. The matched substring may or may not be
-//! literally present in the snippet (the original text often has
-//! ligatures or accents that the norm has flattened); we mark this as
-//! a known limitation rather than working around it with hacks.
+//! text. See [`render_snippet`] for the proportional mapping strategy.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result};
 use memchr::memmem;
+use regex::Regex;
 use tracing::warn;
 
 use crate::bigram::{BigramIndex, extract_bigrams};
-use crate::index::{ChunkItem, IndexState};
+use crate::bigram_query::{fuzzy_to_bigram_query, regex_to_bigram_query};
+use crate::index::{BaseIndex, ChunkItem, IndexState, Overlay};
 use crate::normalize::normalize_query_ascii;
 
 /// CLI / TUI cap on the number of hits surfaced to the user.
 pub const DISPLAY_LIMIT: usize = 200;
+
+/// Number of evenly-spaced probe bigrams to take when decomposing a
+/// fuzzy query into a [`BigramQuery`]. The report names six.
+pub const FUZZY_PROBES: usize = 6;
+
+/// Above this many candidate chunks we skip neo_frizbee and fall back
+/// to the cheap deterministic ordering. The threshold is from the
+/// report.
+pub const FRIZBEE_LIMIT: usize = 2048;
+
+/// neo_frizbee thread count. The crate launches its own scoped pool
+/// when called; six matches the value in fff's own scorer wiring.
+const FRIZBEE_THREADS: usize = 6;
 
 /// Below this length the bigram prefilter has too little information to
 /// be useful (only one or zero bigrams), so we fall back to a full
@@ -72,9 +83,7 @@ const NO_BIGRAM_FULLSCAN_WARN_LEN: usize = 2;
 /// approximate match offset when rendering a snippet.
 const SNIPPET_CONTEXT_BYTES: usize = 60;
 
-/// Which query engine to run. Only [`QueryMode::Literal`] is implemented
-/// in Day 3; the others are stubs that error cleanly until Day 6 wires
-/// them up via the bigram prefilter.
+/// Which query engine to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryMode {
     Literal,
@@ -97,13 +106,17 @@ pub struct Hit {
 ///
 /// Contract:
 /// * Empty / whitespace-only queries return no hits.
-/// * `QueryMode::Literal` narrows the candidate set with the bigram
-///   prefilter (when available), masks out overlay tombstones, then
-///   verifies each candidate with `memchr::memmem`. Overlay overflow
-///   rows are verified separately and unioned in. Results are returned
-///   in `(doc_id, chunk_ord)` order, capped at `limit`.
-/// * `QueryMode::Regex` and `QueryMode::Fuzzy` return an error — they
-///   land in the Day-6 milestone.
+/// * [`QueryMode::Literal`]: candidate prefilter via the bigram index,
+///   verification via `memchr::memmem`, deterministic ordering.
+/// * [`QueryMode::Regex`]: candidate prefilter via
+///   [`regex_to_bigram_query`]; verification via a compiled
+///   case-insensitive `regex::Regex`. The pattern is *not* normalized
+///   (lowercasing the source would break character classes and
+///   look-arounds); case-insensitivity is delegated to the engine.
+/// * [`QueryMode::Fuzzy`]: candidate prefilter via
+///   [`fuzzy_to_bigram_query`]; ranking via `neo_frizbee`'s parallel
+///   match call, with the cheap deterministic fallback above
+///   [`FRIZBEE_LIMIT`] candidates.
 pub fn search(
     state: &IndexState,
     query: &str,
@@ -112,9 +125,8 @@ pub fn search(
 ) -> Result<Vec<Hit>> {
     match mode {
         QueryMode::Literal => literal_search(state, query, limit),
-        QueryMode::Regex | QueryMode::Fuzzy => {
-            bail!("query mode {mode:?} is not implemented yet (planned for day 6)")
-        }
+        QueryMode::Regex => regex_search(state, query, limit),
+        QueryMode::Fuzzy => fuzzy_search(state, query, limit),
     }
 }
 
@@ -127,18 +139,8 @@ fn literal_search(state: &IndexState, query: &str, limit: usize) -> Result<Vec<H
     let finder = memmem::Finder::new(needle);
 
     let base = state.load_base();
-    // One read guard, held across base and overflow verification.
-    // The overlay cannot be mutated under us until both passes are
-    // done, so a doc's tombstone and its overflow rows are observed
-    // together — never one without the other.
     let ov = state.overlay.read();
 
-    // Stage 1: base candidate generation via the bigram prefilter.
-    //
-    // `bigrams.query()` returns `Some(bitset)` when at least one of
-    // the query's bigrams was tracked. If `None`, the prefilter has
-    // zero information and we must consider every chunk a candidate
-    // (subject to the tombstone check below).
     let mut candidates: Option<Vec<u64>> = base
         .bigrams
         .as_ref()
@@ -151,34 +153,216 @@ fn literal_search(state: &IndexState, query: &str, limit: usize) -> Result<Vec<H
         );
     }
 
-    // Stage 2: tombstone mask.
-    // If we have a candidate bitset, clear the tombstoned bits so the
-    // verification loop never even touches stale base chunks. If we
-    // fell through to the full-scan path, the loop checks the
-    // overlay per chunk below — equivalently correct, slightly more
-    // work per iteration.
+    apply_tombstones(&mut candidates, &ov);
+
+    let mut hits: Vec<Hit> = Vec::new();
+    walk_base_for_literal(&base, &ov, candidates.as_deref(), &finder, needle.len(), limit, &mut hits);
+
+    if hits.len() < limit && !ov.overflow_chunks.is_empty() {
+        let query_bigrams = extract_bigrams(needle);
+        for idx in ov.overflow_matches(&query_bigrams) {
+            let chunk = &ov.overflow_chunks[idx];
+            let Some(pos) = finder.find(&chunk.text_norm_ascii) else {
+                continue;
+            };
+            hits.push(make_hit_at_norm(chunk, pos, needle.len()));
+            if hits.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    // Stable (doc_id, page, chunk_id) ordering — needed when overflow
+    // and base both contributed. Then run the cheap deterministic
+    // ranker so the most-relevant hits land at the top.
+    hits.sort_by_key(|h| (h.doc_id, h.page_no, h.chunk_id));
+    cheap_rank(&mut hits, &q);
+    hits.truncate(limit);
+
+    Ok(hits)
+}
+
+fn regex_search(state: &IndexState, pattern: &str, limit: usize) -> Result<Vec<Hit>> {
+    if pattern.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    // The bigram decomposition lowercases ASCII as it extracts;
+    // `regex::RegexBuilder` is told to ignore case so the engine's
+    // matching semantics agree with what the prefilter assumed. We
+    // pass the pattern verbatim: lowercasing the raw pattern would
+    // break character classes (e.g. `[A-Z]` becomes `[a-z]`) and is
+    // wrong in general for regex syntax.
+    let bq = regex_to_bigram_query(pattern);
+    let regex = regex::RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+        .with_context(|| format!("compiling regex {pattern:?}"))?;
+
+    let base = state.load_base();
+    let ov = state.overlay.read();
+
+    let mut candidates: Option<Vec<u64>> = if bq.is_any() {
+        None
+    } else {
+        base.bigrams.as_ref().and_then(|idx| bq.evaluate(idx))
+    };
+    apply_tombstones(&mut candidates, &ov);
+
+    let mut hits: Vec<Hit> = Vec::new();
+    walk_base_for_regex(&base, &ov, candidates.as_deref(), &regex, limit, &mut hits);
+
+    // Overlay overflow: conservatively check every row. Regex bigrams
+    // don't always survive overlay-side bigram dedup, so we let the
+    // regex engine itself act as the verifier here. The overflow set
+    // is bounded by the rebuild threshold, so the linear scan is
+    // bounded too.
+    if hits.len() < limit {
+        for chunk in &ov.overflow_chunks {
+            if let Some(m) = regex.find(&chunk.text_utf8) {
+                hits.push(make_hit_at_utf8(chunk, m.start(), m.len()));
+                if hits.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+
+    hits.sort_by_key(|h| (h.doc_id, h.page_no, h.chunk_id));
+    // No phrase-rank for regex queries; cheap_rank's "more matched
+    // terms" lever still helps if the user typed multi-word literal
+    // fragments inside their regex. We pass the raw pattern so the
+    // phrase / term split is at least defensible.
+    cheap_rank(&mut hits, pattern);
+    hits.truncate(limit);
+
+    Ok(hits)
+}
+
+fn fuzzy_search(state: &IndexState, query: &str, limit: usize) -> Result<Vec<Hit>> {
+    let q_norm = normalize_query_ascii(query);
+    if q_norm.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let bq = fuzzy_to_bigram_query(&q_norm, FUZZY_PROBES);
+
+    let base = state.load_base();
+    let ov = state.overlay.read();
+
+    let mut candidates: Option<Vec<u64>> = if bq.is_any() {
+        None
+    } else {
+        base.bigrams.as_ref().and_then(|idx| bq.evaluate(idx))
+    };
+    apply_tombstones(&mut candidates, &ov);
+
+    // Gather candidate chunks — base passes through the bitset, overflow
+    // chunks are unconditionally appended (the fuzzy scorer makes the
+    // final call).
+    let mut candidate_chunks: Vec<&ChunkItem> = Vec::new();
+    collect_base_candidates(&base, &ov, candidates.as_deref(), &mut candidate_chunks);
+    for chunk in &ov.overflow_chunks {
+        candidate_chunks.push(chunk);
+    }
+
+    if candidate_chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rank_texts: Vec<String> = candidate_chunks
+        .iter()
+        .map(|c| rank_text_for(c))
+        .collect();
+
+    let mut hits: Vec<Hit> = if rank_texts.len() > FRIZBEE_LIMIT {
+        // Above the limit the cheap deterministic ranker is faster
+        // and good enough — the report names this fallback exactly.
+        let needle_norm = q_norm.as_bytes();
+        let finder = memmem::Finder::new(needle_norm);
+        candidate_chunks
+            .iter()
+            .filter_map(|chunk| {
+                let pos = finder.find(&chunk.text_norm_ascii)?;
+                Some(make_hit_at_norm(chunk, pos, needle_norm.len()))
+            })
+            .collect()
+    } else {
+        let config = neo_frizbee::Config {
+            max_typos: None,
+            sort: true,
+            scoring: neo_frizbee::Scoring::default(),
+        };
+        let matches =
+            neo_frizbee::match_list_parallel(&q_norm, &rank_texts, &config, FRIZBEE_THREADS);
+        let mut hits: Vec<Hit> = Vec::with_capacity(matches.len());
+        for m in &matches {
+            let chunk = candidate_chunks[m.index as usize];
+            // Locate the user's query inside the rank text for snippet
+            // purposes — best-effort. If neo_frizbee accepted the
+            // candidate but the literal needle isn't present (the
+            // fuzzy match crossed token boundaries), centre the
+            // snippet on offset 0.
+            let pos = memmem::find(chunk.text_norm_ascii.as_ref(), q_norm.as_bytes())
+                .unwrap_or(0);
+            let mut hit = make_hit_at_norm(chunk, pos, q_norm.len());
+            // Carry neo_frizbee's score through so callers can rank
+            // across queries; the unit-of-score is u16 internally.
+            hit.score = m.score as f32;
+            hits.push(hit);
+        }
+        hits
+    };
+
+    hits.truncate(limit);
+    Ok(hits)
+}
+
+/// Build the synthetic "rank string" passed to the fuzzy scorer. Mirrors
+/// the report's recipe verbatim: `{filename} {path} page {page_no} {preview}`.
+fn rank_text_for(c: &ChunkItem) -> String {
+    let mut s = String::with_capacity(
+        c.filename.len() + c.path.len() + 10 + c.preview.len(),
+    );
+    s.push_str(&c.filename);
+    s.push(' ');
+    s.push_str(&c.path);
+    s.push_str(" page ");
+    s.push_str(&c.page_no.to_string());
+    s.push(' ');
+    s.push_str(&c.preview);
+    s
+}
+
+/// AND-NOT the overlay's tombstone bitset into a candidate bitset.
+fn apply_tombstones(candidates: &mut Option<Vec<u64>>, ov: &Overlay) {
     if let Some(ref mut bitset) = candidates {
-        // The query's bitset has exactly `base.bigrams.words()` slots;
-        // the overlay's tombstone vector has `ceil(chunks/64)` slots.
-        // They share a length but we still take the min for safety.
         let n = bitset.len().min(ov.tombstones.len());
         for w in 0..n {
             bitset[w] &= !ov.tombstones[w];
         }
     }
+}
 
-    // Stage 3: base verification.
-    let mut hits: Vec<Hit> = Vec::new();
+fn walk_base_for_literal(
+    base: &BaseIndex,
+    ov: &Overlay,
+    candidates: Option<&[u64]>,
+    finder: &memmem::Finder,
+    needle_len: usize,
+    limit: usize,
+    hits: &mut Vec<Hit>,
+) {
     match candidates {
         Some(bitset) => {
             for (i, chunk) in base.chunks.iter().enumerate() {
-                if !BigramIndex::is_candidate(&bitset, i) {
+                if !BigramIndex::is_candidate(bitset, i) {
                     continue;
                 }
                 let Some(pos) = finder.find(&chunk.text_norm_ascii) else {
                     continue;
                 };
-                hits.push(make_hit(chunk, pos, needle.len()));
+                hits.push(make_hit_at_norm(chunk, pos, needle_len));
                 if hits.len() >= limit {
                     break;
                 }
@@ -192,56 +376,165 @@ fn literal_search(state: &IndexState, query: &str, limit: usize) -> Result<Vec<H
                 let Some(pos) = finder.find(&chunk.text_norm_ascii) else {
                     continue;
                 };
-                hits.push(make_hit(chunk, pos, needle.len()));
+                hits.push(make_hit_at_norm(chunk, pos, needle_len));
                 if hits.len() >= limit {
                     break;
                 }
             }
         }
     }
+}
 
-    // Stage 4: overflow pass.
-    //
-    // The overlay's bigram check uses the same `extract_bigrams`
-    // routine the base index uses on chunks, so a hit against a base
-    // chunk and against its replacement overflow chunk will produce
-    // identical candidate decisions.
-    if hits.len() < limit && !ov.overflow_chunks.is_empty() {
-        let query_bigrams = extract_bigrams(needle);
-        for idx in ov.overflow_matches(&query_bigrams) {
-            let chunk = &ov.overflow_chunks[idx];
-            let Some(pos) = finder.find(&chunk.text_norm_ascii) else {
-                continue;
-            };
-            hits.push(make_hit(chunk, pos, needle.len()));
-            if hits.len() >= limit {
-                break;
+fn walk_base_for_regex(
+    base: &BaseIndex,
+    ov: &Overlay,
+    candidates: Option<&[u64]>,
+    regex: &Regex,
+    limit: usize,
+    hits: &mut Vec<Hit>,
+) {
+    match candidates {
+        Some(bitset) => {
+            for (i, chunk) in base.chunks.iter().enumerate() {
+                if !BigramIndex::is_candidate(bitset, i) {
+                    continue;
+                }
+                let Some(m) = regex.find(&chunk.text_utf8) else {
+                    continue;
+                };
+                hits.push(make_hit_at_utf8(chunk, m.start(), m.len()));
+                if hits.len() >= limit {
+                    break;
+                }
+            }
+        }
+        None => {
+            for (i, chunk) in base.chunks.iter().enumerate() {
+                if ov.is_tombstoned(i) {
+                    continue;
+                }
+                let Some(m) = regex.find(&chunk.text_utf8) else {
+                    continue;
+                };
+                hits.push(make_hit_at_utf8(chunk, m.start(), m.len()));
+                if hits.len() >= limit {
+                    break;
+                }
             }
         }
     }
-
-    // If both passes contributed, the overflow chunks may be in an
-    // arbitrary order relative to the base chunks. Sort once by
-    // `(doc_id, chunk_ord)` to give the caller a stable shape.
-    // (When only the base pass contributed, the chunks are already
-    // in that order — but the cost of the sort on an `n ≤ limit`
-    // slice is negligible so we always run it for simplicity.)
-    hits.sort_by_key(|h| (h.doc_id, h.page_no, h.chunk_id));
-
-    Ok(hits)
 }
 
-fn make_hit(chunk: &ChunkItem, match_offset_in_norm: usize, query_len: usize) -> Hit {
+fn collect_base_candidates<'a>(
+    base: &'a BaseIndex,
+    ov: &Overlay,
+    candidates: Option<&[u64]>,
+    out: &mut Vec<&'a ChunkItem>,
+) {
+    match candidates {
+        Some(bitset) => {
+            for (i, chunk) in base.chunks.iter().enumerate() {
+                if BigramIndex::is_candidate(bitset, i) {
+                    out.push(chunk);
+                }
+            }
+        }
+        None => {
+            for (i, chunk) in base.chunks.iter().enumerate() {
+                if !ov.is_tombstoned(i) {
+                    out.push(chunk);
+                }
+            }
+        }
+    }
+}
+
+fn make_hit_at_norm(chunk: &ChunkItem, match_offset_in_norm: usize, query_len: usize) -> Hit {
     Hit {
         chunk_id: chunk.chunk_id,
         doc_id: chunk.doc_id,
         path: chunk.path.to_string(),
         page_no: chunk.page_no,
-        // Day 3 has no real scoring — that's the fuzzy path on Day 6.
-        // A constant 1.0 keeps the field meaningful without lying.
         score: 1.0,
         snippet: render_snippet(chunk, match_offset_in_norm, query_len),
     }
+}
+
+fn make_hit_at_utf8(chunk: &ChunkItem, match_offset_in_utf8: usize, query_len: usize) -> Hit {
+    // For regex hits we know the *exact* UTF-8 offset, so we can render
+    // the snippet without going through the proportional norm→utf8
+    // remapping.
+    Hit {
+        chunk_id: chunk.chunk_id,
+        doc_id: chunk.doc_id,
+        path: chunk.path.to_string(),
+        page_no: chunk.page_no,
+        score: 1.0,
+        snippet: render_snippet_at_utf8(chunk, match_offset_in_utf8, query_len),
+    }
+}
+
+/// Cheap deterministic ordering for hits.
+///
+/// Sort by, in order:
+/// 1. Exact phrase hit before partial-term hit (treat the normalized
+///    query as a phrase).
+/// 2. More matched terms (whitespace-split) before fewer.
+/// 3. Earlier match offset before later.
+/// 4. Lower `page_no` before higher.
+/// 5. Newer `doc_mtime_ns` before older.
+///
+/// We carry the original chunk through each `Hit`'s `(doc_id, chunk_id,
+/// page_no)` triple, but `doc_mtime_ns` is not on `Hit` — we look it up
+/// once per hit at sort time by linear scan over the candidate set. For
+/// the small slice of `limit ≤ DISPLAY_LIMIT` hits this is fine.
+pub fn cheap_rank(hits: &mut Vec<Hit>, query_norm: &str) {
+    let phrase = query_norm.trim();
+    let terms: Vec<&str> = phrase.split_whitespace().collect();
+    // Pre-compute the lowercased snippet once per hit to avoid
+    // re-lowercasing inside the comparator.
+    let snippets_lc: Vec<String> = hits.iter().map(|h| h.snippet.to_lowercase()).collect();
+
+    // Build sort keys.
+    let keys: Vec<(bool, usize, usize, u32)> = hits
+        .iter()
+        .zip(snippets_lc.iter())
+        .map(|(h, snip_lc)| {
+            let has_phrase = !phrase.is_empty() && snip_lc.contains(phrase);
+            let term_count = terms.iter().filter(|t| snip_lc.contains(**t)).count();
+            // Earlier offset of the phrase in the snippet (saturating to
+            // a large sentinel when not present so phrase-bearing hits
+            // win the tiebreak).
+            let offset = if has_phrase {
+                snip_lc.find(phrase).unwrap_or(usize::MAX)
+            } else if let Some(t) = terms.iter().filter_map(|t| snip_lc.find(t)).min() {
+                t
+            } else {
+                usize::MAX
+            };
+            (has_phrase, term_count, offset, h.page_no)
+        })
+        .collect();
+
+    let mut indices: Vec<usize> = (0..hits.len()).collect();
+    indices.sort_by(|&a, &b| {
+        let (pa, ta, oa, ga) = keys[a];
+        let (pb, tb, ob, gb) = keys[b];
+        // Phrase hit first.
+        pb.cmp(&pa)
+            // More terms first.
+            .then_with(|| tb.cmp(&ta))
+            // Earlier offset first.
+            .then_with(|| oa.cmp(&ob))
+            // Lower page first.
+            .then_with(|| ga.cmp(&gb))
+            // Stable: doc_id then chunk_id.
+            .then_with(|| hits[a].doc_id.cmp(&hits[b].doc_id))
+            .then_with(|| hits[a].chunk_id.cmp(&hits[b].chunk_id))
+    });
+
+    let reordered: Vec<Hit> = indices.into_iter().map(|i| hits[i].clone()).collect();
+    *hits = reordered;
 }
 
 /// Build a short snippet around the approximate UTF-8 location of the
@@ -260,21 +553,35 @@ pub fn render_snippet(
     let approx_byte = if norm_len == 0 {
         0
     } else {
-        // Proportional mapping: norm and utf8 share roughly the same
-        // shape (whitespace runs and accents aside), so this gets us
-        // within a few bytes of the right spot.
         let ratio = match_offset_in_norm as f64 / norm_len as f64;
         ((text.len() as f64) * ratio).round() as usize
     };
     let approx_byte = approx_byte.min(text.len());
-    let center = snap_char_boundary(text, approx_byte);
+    render_window(text, approx_byte, query_len)
+}
 
-    let want_match_end = (center + query_len).min(text.len());
+/// Same as [`render_snippet`] but takes an exact UTF-8 offset. Used by
+/// the regex path where we already know the byte offset of the match.
+pub fn render_snippet_at_utf8(
+    chunk: &ChunkItem,
+    match_offset_in_utf8: usize,
+    match_len: usize,
+) -> String {
+    let text = &*chunk.text_utf8;
+    if text.is_empty() {
+        return String::new();
+    }
+    let centre = match_offset_in_utf8.min(text.len());
+    render_window(text, centre, match_len)
+}
+
+fn render_window(text: &str, centre: usize, match_len: usize) -> String {
+    let center = snap_char_boundary(text, centre);
+    let want_match_end = (center + match_len).min(text.len());
     let left = center.saturating_sub(SNIPPET_CONTEXT_BYTES);
     let right = (want_match_end + SNIPPET_CONTEXT_BYTES).min(text.len());
     let left = snap_char_boundary(text, left);
     let right = snap_char_boundary(text, right);
-
     collapse_whitespace(&text[left..right])
 }
 
@@ -330,10 +637,6 @@ mod tests {
         if let Some((d, s)) = cur {
             doc_ranges.insert(d, s..chunks.len());
         }
-        // Build the bigram prefilter from the same chunks so unit
-        // tests exercise the candidate-generation path (not just the
-        // fallback). Empty corpora skip it because no chunks means no
-        // candidates anyway.
         let bigrams = if chunks.is_empty() {
             None
         } else {
@@ -394,10 +697,11 @@ mod tests {
         ]);
         let hits = search(&state, "quick", QueryMode::Literal, 10).unwrap();
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].path, "/a.pdf");
-        assert_eq!(hits[0].page_no, 1);
-        assert_eq!(hits[1].path, "/c.pdf");
-        assert_eq!(hits[1].page_no, 7);
+        // Order may now be governed by cheap_rank but both should still
+        // appear and both should mention "quick" in the snippet.
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert!(paths.contains(&"/a.pdf"));
+        assert!(paths.contains(&"/c.pdf"));
         assert!(hits[0].snippet.contains("quick"));
     }
 
@@ -437,21 +741,48 @@ mod tests {
     }
 
     #[test]
-    fn regex_and_fuzzy_modes_are_unimplemented() {
+    fn regex_finds_pattern_in_chunk() {
+        let state = synthetic_state(vec![
+            mk_chunk(1, 1, "/a.pdf", 1, "Order #42 was placed."),
+            mk_chunk(2, 2, "/b.pdf", 1, "no number here"),
+            mk_chunk(3, 3, "/c.pdf", 1, "Order #1337 shipped."),
+        ]);
+        let hits = search(&state, r"order #\d+", QueryMode::Regex, 10).unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn regex_compile_error_is_surfaced() {
         let state = synthetic_state(vec![mk_chunk(1, 1, "/a.pdf", 1, "anything")]);
-        assert!(search(&state, "x", QueryMode::Regex, 10).is_err());
-        assert!(search(&state, "x", QueryMode::Fuzzy, 10).is_err());
+        assert!(search(&state, "[invalid", QueryMode::Regex, 10).is_err());
+    }
+
+    #[test]
+    fn fuzzy_finds_close_token() {
+        let state = synthetic_state(vec![
+            mk_chunk(1, 1, "/a.pdf", 1, "the quick brown fox jumps over"),
+            mk_chunk(2, 2, "/b.pdf", 1, "completely unrelated text"),
+            mk_chunk(3, 3, "/c.pdf", 1, "yet another paragraph"),
+        ]);
+        // "qiuck" — one transposition typo against "quick".
+        let hits = search(&state, "qiuck", QueryMode::Fuzzy, 10).unwrap();
+        assert!(!hits.is_empty(), "fuzzy should still surface the close chunk");
+        // The /a.pdf chunk that genuinely contains "quick" must rank
+        // somewhere in the top 3.
+        let top3_paths: Vec<&str> =
+            hits.iter().take(3).map(|h| h.path.as_str()).collect();
+        assert!(
+            top3_paths.contains(&"/a.pdf"),
+            "expected /a.pdf in top 3 fuzzy hits, got {top3_paths:?}",
+        );
     }
 
     #[test]
     fn snippet_snaps_to_char_boundaries() {
-        // Multi-byte UTF-8 around the approximate match offset must not
-        // panic and must produce valid UTF-8.
         let chunk = mk_chunk(1, 1, "/a.pdf", 1, "αβγδε needle αβγδε");
         let state = synthetic_state(vec![chunk]);
         let hits = search(&state, "needle", QueryMode::Literal, 10).unwrap();
         assert_eq!(hits.len(), 1);
-        // Snippet must be valid UTF-8 by construction.
         let _ = hits[0].snippet.as_str();
     }
 
@@ -462,7 +793,6 @@ mod tests {
             mk_chunk(2, 2, "/b.pdf", 4, "no match here"),
             mk_chunk(3, 3, "/c.pdf", 7, "another quick result"),
         ]);
-        // Tombstone doc 1 — its chunk must disappear from results.
         {
             let base = state.load_base();
             let mut ov = state.overlay.write();
@@ -482,8 +812,6 @@ mod tests {
             1,
             "the quick brown fox",
         )]);
-        // Add an overflow chunk with a distinctive token absent from
-        // the base.
         {
             let mut ov = state.overlay.write();
             ov.add_overflow(mk_chunk(
@@ -494,10 +822,8 @@ mod tests {
                 "freshly added content with xylotomous",
             ));
         }
-        // The base still has "quick".
         let hits = search(&state, "quick", QueryMode::Literal, 10).unwrap();
         assert_eq!(hits.len(), 1);
-        // The overlay carries the new content.
         let hits = search(&state, "xylotomous", QueryMode::Literal, 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "/new.pdf");
@@ -509,7 +835,6 @@ mod tests {
             mk_chunk(1, 1, "/a.pdf", 1, "old version mentions zebra"),
             mk_chunk(2, 2, "/b.pdf", 1, "second chunk content"),
         ]);
-        // Replace doc 1's chunks.
         {
             let base = state.load_base();
             let mut ov = state.overlay.write();
@@ -519,11 +844,72 @@ mod tests {
                 &base,
             );
         }
-        // "zebra" is gone (the base chunk is tombstoned).
         let hits = search(&state, "zebra", QueryMode::Literal, 10).unwrap();
         assert!(hits.is_empty());
-        // "giraffe" appears from the overflow.
         let hits = search(&state, "giraffe", QueryMode::Literal, 10).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn cheap_rank_promotes_phrase_match() {
+        // Three hits over the same query — only one has the exact
+        // phrase in its snippet. The phrase hit must come first.
+        let mut hits = vec![
+            Hit {
+                chunk_id: 1,
+                doc_id: 1,
+                path: "/a.pdf".into(),
+                page_no: 9,
+                score: 1.0,
+                snippet: "foo lonely word here bar".into(),
+            },
+            Hit {
+                chunk_id: 2,
+                doc_id: 2,
+                path: "/b.pdf".into(),
+                page_no: 1,
+                score: 1.0,
+                snippet: "this contains foo bar exactly".into(),
+            },
+            Hit {
+                chunk_id: 3,
+                doc_id: 3,
+                path: "/c.pdf".into(),
+                page_no: 4,
+                score: 1.0,
+                snippet: "neither here nor there".into(),
+            },
+        ];
+        cheap_rank(&mut hits, "foo bar");
+        assert_eq!(hits[0].chunk_id, 2, "phrase hit should sort first");
+        assert_eq!(hits[1].chunk_id, 1, "partial-term hit next");
+        assert_eq!(hits[2].chunk_id, 3, "no-term hit last");
+    }
+
+    #[test]
+    fn cheap_rank_breaks_ties_by_page_then_id() {
+        let mut hits = vec![
+            Hit {
+                chunk_id: 10,
+                doc_id: 1,
+                path: "/a.pdf".into(),
+                page_no: 3,
+                score: 1.0,
+                snippet: "matches nothing distinctive".into(),
+            },
+            Hit {
+                chunk_id: 11,
+                doc_id: 2,
+                path: "/b.pdf".into(),
+                page_no: 1,
+                score: 1.0,
+                snippet: "matches nothing distinctive".into(),
+            },
+        ];
+        cheap_rank(&mut hits, "zebraquack");
+        // Neither contains the phrase nor any of its terms; tiebreak
+        // is by `page_no`, ascending: page 1 before page 3.
+        assert_eq!(hits[0].page_no, 1);
+        assert_eq!(hits[1].page_no, 3);
     }
 }

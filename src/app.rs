@@ -27,7 +27,7 @@ use tracing::{info, warn};
 
 use crate::db::{Db, DocStatus, ExtractedDoc, LoadedChunkRow};
 use crate::extract::{ensure_pdftotext_available, extract_pdf, probe_pdftotext_or_explain};
-use crate::index::{ChunkItem, IndexState, load_base_index_from_db};
+use crate::index::{ChunkItem, IndexState, load_base_index_from_db, rebuild_from_db};
 use crate::query::{Hit, QueryMode, search};
 use crate::scanner::{DirtyReason, ScanJob, Scanner, scan_one};
 use crate::watcher::{WatchEvent, WatcherHandle, spawn_watcher};
@@ -172,9 +172,8 @@ pub fn run_index(db_path: &Path, root: &Path, opts: &IndexOptions) -> Result<Ind
     })
 }
 
-/// One-shot search: open the DB, load the base index, run a literal
-/// query, return the hits. Day 3 keeps this synchronous — there is no
-/// watcher, rebuild loop, or persistent process yet.
+/// One-shot search: open the DB, load the base index, run a query,
+/// return the hits. This is the CLI's `search` entry point.
 pub fn run_search(
     db_path: &Path,
     query: &str,
@@ -186,6 +185,41 @@ pub fn run_search(
     let base = load_base_index_from_db(&db)?;
     let state = IndexState::new(base);
     search(&state, query, mode, limit)
+}
+
+/// Statistics returned by [`run_rebuild`]. Each `pdffff rebuild`
+/// invocation prints this verbatim.
+#[derive(Debug, Clone)]
+pub struct RebuildStats {
+    pub chunks: usize,
+    pub docs: usize,
+    pub bigram_heap_bytes: usize,
+    pub elapsed_secs: f64,
+}
+
+/// Force a rebuild of the in-memory base index from SQLite. Useful as a
+/// CLI verb for diagnostics and benchmarks; the long-lived watch path
+/// instead uses [`IndexState::rebuild_if_needed`].
+///
+/// No-op semantically across a CLI lifecycle (each `search` already
+/// loads the base fresh), but prints the same stats the live rebuild
+/// would log so the user can sanity-check the corpus shape.
+pub fn run_rebuild(db_path: &Path) -> Result<RebuildStats> {
+    let started = Instant::now();
+    let db = Db::open_reader(db_path)
+        .with_context(|| format!("opening DB at {} for rebuild", db_path.display()))?;
+    // We rebuild into a freshly-constructed `IndexState` rather than
+    // mutating a long-lived one — the CLI exits immediately after.
+    let state = IndexState::new(crate::index::BaseIndex::empty());
+    rebuild_from_db(&state, &db)?;
+    let base = state.load_base();
+    let bigram_heap_bytes = base.bigrams.as_ref().map(|b| b.heap_bytes()).unwrap_or(0);
+    Ok(RebuildStats {
+        chunks: base.chunks.len(),
+        docs: base.doc_ranges.len(),
+        bigram_heap_bytes,
+        elapsed_secs: started.elapsed().as_secs_f64(),
+    })
 }
 
 /// Knobs for [`run_watch`]. Mirrors [`IndexOptions`] + the watcher's
@@ -507,7 +541,7 @@ fn writer_thread(
 ) -> Result<()> {
     let mut db = Db::open(&db_path).context("writer thread: opening SQLite")?;
     while let Ok(msg) = rx.recv() {
-        match msg {
+        let mutated = match msg {
             WriterMsg::Doc(doc) => {
                 let status = doc.status;
                 let path = doc.path.clone();
@@ -527,10 +561,12 @@ fn writer_thread(
                                 warn!(path = %path.display(), ?err, "applying overlay update");
                             }
                         }
+                        true
                     }
                     Err(err) => {
                         warn!(path = %path.display(), ?err, "upsert_extracted failed");
                         counters.error.fetch_add(1, Ordering::Relaxed);
+                        false
                     }
                 }
             }
@@ -542,14 +578,40 @@ fn writer_thread(
                         let mut ov = state.overlay.write();
                         ov.tombstone_doc(doc_id, &base);
                     }
+                    true
                 }
                 Ok(None) => {
                     // Path wasn't known to the DB — nothing to tombstone.
+                    false
                 }
                 Err(err) => {
                     warn!(path = %path.display(), ?err, "mark_deleted failed");
+                    false
                 }
             },
+        };
+
+        // After each mutation that touched the overlay, check the
+        // rebuild thresholds. The check itself is cheap (one stats
+        // sweep); the rebuild only fires when the predicate trips.
+        //
+        // Doing this on the writer thread (rather than a separate
+        // rebuilder thread) is intentional: the writer is the *only*
+        // mutator of the overlay, so rebuilding here means we cannot
+        // race a concurrent overlay update against an in-flight
+        // rebuild. The brief stall on the writer is acceptable —
+        // rebuild_from_db on the threshold-tripping corpora (10k
+        // overflow chunks, ~10% tombstones) is bounded by the time
+        // to stream chunks from SQLite plus the dense-bigram build,
+        // which is the same work startup pays on every process boot.
+        if mutated {
+            if let Some(state) = &live_state {
+                match state.rebuild_if_needed(&db) {
+                    Ok(true) => info!("writer thread completed a base rebuild"),
+                    Ok(false) => {}
+                    Err(err) => warn!(?err, "rebuild_if_needed failed"),
+                }
+            }
         }
     }
     Ok(())
@@ -575,8 +637,9 @@ fn apply_overlay_for_upsert(db: &Db, state: &IndexState, doc_id: i64) -> Result<
         // base for overflow atomically.
         ov.modify_doc(doc_id, chunks, &base);
     }
-    // Day 6 owns the actual rebuild; here we only log the threshold.
-    let _ = state.needs_rebuild(&ov, &base);
+    // The writer thread runs `state.rebuild_if_needed(&db)` after this
+    // returns — once the write lock has been dropped — so the threshold
+    // check is part of the message-loop tick, not this function.
     Ok(())
 }
 

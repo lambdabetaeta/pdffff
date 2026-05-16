@@ -342,8 +342,6 @@ impl IndexState {
 
     /// True when the overlay has drifted far enough from the base
     /// that a rebuild would be cheaper than continuing to scan it.
-    /// Day 5 only exposes the predicate; Day 6 owns the rebuild
-    /// pipeline.
     ///
     /// Two thresholds:
     /// * Too many overflow chunks: querying them is a linear scan,
@@ -355,7 +353,7 @@ impl IndexState {
     ///   tombstoned candidates is wasted work.
     ///
     /// Emits a `tracing::info!` the first call that crosses the
-    /// threshold so Day 6's rebuild loop has a clear hook.
+    /// threshold so the rebuild loop has a clear hook.
     pub fn needs_rebuild(&self, ov: &Overlay, base: &BaseIndex) -> bool {
         let stats = ov.stats();
         let by_overflow = stats.overflow_chunks >= REBUILD_OVERLAY_CHUNKS;
@@ -376,6 +374,73 @@ impl IndexState {
         }
         false
     }
+
+    /// Check `needs_rebuild` against the current `(base, overlay)`
+    /// snapshot. If true, drop the read guards, run
+    /// [`rebuild_from_db`], and emit a `tracing::info!` summarising
+    /// the new state.
+    ///
+    /// Returns `true` when a rebuild ran. The caller — typically the
+    /// long-lived DB writer thread in `crate::app::run_watch` — should
+    /// call this after each batch of overlay mutations to keep the
+    /// overlay bounded.
+    pub fn rebuild_if_needed(&self, db: &Db) -> Result<bool> {
+        // Hold the read locks for *exactly* the check; drop them
+        // before acquiring the write lock inside `rebuild_from_db` so
+        // we don't deadlock against ourselves.
+        let needs = {
+            let ov = self.overlay.read();
+            let base = self.base.load();
+            self.needs_rebuild(&ov, &base)
+        };
+        if !needs {
+            return Ok(false);
+        }
+        rebuild_from_db(self, db)?;
+        Ok(true)
+    }
+}
+
+/// Rebuild the [`BaseIndex`] from SQLite and atomically swap it into
+/// `state`, then reset the overlay.
+///
+/// The swap is intentionally minimal: a single `ArcSwap::store` for the
+/// base plus an overlay reset under a single write lock. A reader either
+/// sees the *old* `(base, overlay)` pair or the *new* `(base, fresh
+/// overlay)` pair, never a torn snapshot — because every reader holds
+/// its `overlay.read()` guard for the duration of its candidate +
+/// verification passes, and the swap of `base` is itself atomic via
+/// `arc-swap`.
+///
+/// This is the routine called by [`IndexState::rebuild_if_needed`]; it
+/// is also exposed publicly so the CLI's `rebuild` subcommand can force
+/// a rebuild on demand.
+pub fn rebuild_from_db(state: &IndexState, db: &Db) -> Result<()> {
+    let new_base = load_base_index_from_db(db)?;
+    let new_chunk_count = new_base.chunks.len();
+    let prev_overflow;
+    let prev_tombstones;
+    let prev_generation;
+    {
+        // Acquire the write lock *before* publishing the new base so
+        // concurrent readers don't observe a (new_base, stale_overlay)
+        // pair where stale_overlay's tombstones index into the
+        // previous base layout.
+        let mut ov = state.overlay.write();
+        prev_overflow = ov.overflow_chunks.len();
+        prev_tombstones = ov.tombstones.iter().map(|w| w.count_ones() as usize).sum::<usize>();
+        prev_generation = ov.generation;
+        state.base.store(Arc::new(new_base));
+        *ov = Overlay::new(new_chunk_count);
+    }
+    info!(
+        chunks = new_chunk_count,
+        prev_overflow,
+        prev_tombstones,
+        prev_generation,
+        "base index rebuilt and overlay reset",
+    );
+    Ok(())
 }
 
 /// Stream `chunks` out of SQLite and assemble a [`BaseIndex`].
