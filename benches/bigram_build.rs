@@ -38,20 +38,20 @@ fn make_chunks(n: usize) -> Vec<ChunkItem> {
                 .collect();
             let text = words.join(" ");
             let norm = pdffff::normalize::normalize_for_index(&text);
-            ChunkItem {
-                chunk_id: i as i64,
-                doc_id: (i / 25) as i64,
-                path: Arc::from("/synth/c.pdf"),
-                filename: Arc::from("c.pdf"),
-                page_no: (i % 25 + 1) as u32,
-                chunk_ord: (i % 25) as u32,
-                char_start: 0,
-                char_end: text.len() as u32,
-                text_utf8: Arc::<str>::from(text.as_str()),
-                text_norm_ascii: Arc::<[u8]>::from(norm.as_bytes()),
-                preview: Arc::<str>::from(text.as_str()),
-                doc_mtime_ns: 0,
-            }
+            ChunkItem::new(
+                i as i64,
+                (i / 25) as i64,
+                Arc::from("/synth/c.pdf"),
+                Arc::from("c.pdf"),
+                (i % 25 + 1) as u32,
+                (i % 25) as u32,
+                0,
+                text.len() as u32,
+                Arc::<str>::from(text.as_str()),
+                Arc::<[u8]>::from(norm.as_bytes()),
+                Arc::<str>::from(text.as_str()),
+                0,
+            )
         })
         .collect()
 }

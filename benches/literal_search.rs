@@ -72,20 +72,20 @@ fn make_chunk(rng: &mut ChaCha8Rng, idx: usize, total_chunks: usize) -> ChunkIte
     let text = words.join(" ");
     let norm = pdffff::normalize::normalize_for_index(&text);
     let path = "/synth/chunk.pdf";
-    ChunkItem {
-        chunk_id: idx as i64,
-        doc_id: (idx / 25) as i64, // ~25 chunks per "doc"
-        path: Arc::from(path),
-        filename: Arc::from("chunk.pdf"),
-        page_no: (idx % 25 + 1) as u32,
-        chunk_ord: (idx % 25) as u32,
-        char_start: 0,
-        char_end: text.len() as u32,
-        text_utf8: Arc::<str>::from(text.as_str()),
-        text_norm_ascii: Arc::<[u8]>::from(norm.as_bytes()),
-        preview: Arc::<str>::from(text.as_str()),
-        doc_mtime_ns: 0,
-    }
+    ChunkItem::new(
+        idx as i64,
+        (idx / 25) as i64, // ~25 chunks per "doc"
+        Arc::from(path),
+        Arc::from("chunk.pdf"),
+        (idx % 25 + 1) as u32,
+        (idx % 25) as u32,
+        0,
+        text.len() as u32,
+        Arc::<str>::from(text.as_str()),
+        Arc::<[u8]>::from(norm.as_bytes()),
+        Arc::<str>::from(text.as_str()),
+        0,
+    )
 }
 
 fn build_state(n: usize) -> IndexState {
