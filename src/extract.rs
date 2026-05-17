@@ -47,17 +47,39 @@ pub const CHUNK_OVERLAP_CHARS: usize = 200;
 /// Maximum length of the `chunks.preview` field, in bytes (ASCII-only).
 pub const PREVIEW_MAX_BYTES: usize = 200;
 
-/// Verify that `pdftotext` is available on `PATH` before launching the
-/// extractor pool. The error message is intentionally directly actionable.
+/// Verify that `pdftotext` is available on `PATH` *and* usable before
+/// launching the extractor pool. Two failure modes are surfaced
+/// distinctly so the user gets an actionable error instead of a stream
+/// of per-doc extractor failures later:
+///
+/// * `pdftotext` is not on `PATH` ⇒ point at the install command.
+/// * `pdftotext` is on `PATH` but `pdftotext -v` exits nonzero with no
+///   stderr ⇒ refuse to run; a silent failure typically means the
+///   binary is broken (mismatched libraries, sandbox blocking exec,
+///   etc.) and continuing would just churn through `Error` rows.
+///
+/// `pdftotext -v` writes its banner to stderr and exits 0 on every
+/// poppler version I've seen; we accept either exit-0 or a nonempty
+/// stderr banner.
 pub fn ensure_pdftotext_available() -> Result<()> {
-    match Command::new("pdftotext").arg("-v").output() {
-        Ok(_) => Ok(()),
-        Err(err) => Err(anyhow!(
-            "pdftotext (poppler-utils) is required but not on PATH: {err}.\n\
-             Install it (e.g. `apt-get install poppler-utils` or `brew install poppler`) \
-             and retry."
-        )),
+    let out = match Command::new("pdftotext").arg("-v").output() {
+        Ok(o) => o,
+        Err(err) => {
+            return Err(anyhow!(
+                "pdftotext (poppler-utils) is required but not on PATH: {err}.\n\
+                 Install it (e.g. `apt-get install poppler-utils` or `brew install poppler`) \
+                 and retry."
+            ));
+        }
+    };
+    if !out.status.success() && out.stderr.is_empty() {
+        bail!(
+            "pdftotext is present but `pdftotext -v` failed silently \
+             (status {:?}); refusing to run.",
+            out.status.code()
+        );
     }
+    Ok(())
 }
 
 /// Split the full extracted document text on ASCII form-feed (`\x0c`).
@@ -369,29 +391,6 @@ fn make_preview(text: &str) -> String {
 /// `pdffff diagnose` to surface the installed poppler version.
 pub fn extractor_version_or_missing() -> String {
     crate::db::extractor_version()
-}
-
-/// Sanity check: returns `Err` if `pdftotext` is on PATH but appears
-/// unusable. Called at launcher startup before the indexer threads
-/// kick in, so the user gets a clean error rather than a stream of
-/// per-doc extractor failures.
-pub fn probe_pdftotext_or_explain() -> Result<()> {
-    let out = Command::new("pdftotext")
-        .arg("-v")
-        .output()
-        .with_context(|| "pdftotext (poppler-utils) is required and must be on PATH")?;
-    // `pdftotext -v` writes its banner to stderr and exits 0 on every
-    // poppler version I've seen. We accept either exit-0 or a nonempty
-    // stderr banner — a totally silent failure is the only thing we
-    // refuse.
-    if !out.status.success() && out.stderr.is_empty() {
-        bail!(
-            "pdftotext is present but `pdftotext -v` failed silently \
-             (status {:?}); refusing to run.",
-            out.status.code()
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]

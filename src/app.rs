@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 use crate::db::{Db, DocStatus, ExtractedDoc, LoadedChunkRow};
-use crate::extract::{ensure_pdftotext_available, extract_pdf, probe_pdftotext_or_explain};
+use crate::extract::{ensure_pdftotext_available, extract_pdf};
 use crate::index::{ChunkItem, IndexState, load_base_index_from_db};
 use crate::scanner::{DirtyReason, ScanJob, Scanner, scan_one};
 use crate::watcher::{WatchEvent, WatcherHandle, spawn_watcher};
@@ -135,22 +135,17 @@ impl WatchHandle {
 pub fn run_watch(db_path: &Path, root: &Path, opts: &WatchOptions) -> Result<WatchHandle> {
     if opts.require_pdftotext {
         ensure_pdftotext_available()?;
-        probe_pdftotext_or_explain()?;
     }
 
-    // Make sure the DB file exists and has the schema applied before
-    // any background thread tries to open a reader against it.
-    {
-        let _ = Db::open(db_path)
-            .with_context(|| format!("opening DB at {} for initial schema", db_path.display()))?;
-    }
-
-    // Load whatever's already durable. On a brand-new corpus this is
-    // an empty BaseIndex — queries against it return zero hits, which
-    // is fine, because the coordinator's initial scan will start
-    // streaming results into the overlay almost immediately.
+    // Open one connection up front: apply the schema (so the writer /
+    // coordinator threads find a populated DB when they open their own
+    // connections) and stream the existing chunks into the in-memory
+    // BaseIndex from the same connection. On a brand-new corpus the
+    // load yields an empty BaseIndex — queries against it return zero
+    // hits, which is fine, because the coordinator's initial scan
+    // will start streaming results into the overlay almost immediately.
     let state = {
-        let db = Db::open_reader(db_path)
+        let db = Db::open(db_path)
             .with_context(|| format!("opening DB at {} for initial load", db_path.display()))?;
         let base = load_base_index_from_db(&db)?;
         Arc::new(IndexState::new(base))
