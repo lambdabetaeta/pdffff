@@ -294,33 +294,45 @@ fn fuzzy_search(state: &IndexState, query: &str, limit: usize) -> Result<Vec<Hit
         return Ok(Vec::new());
     }
 
-    let rank_texts: Vec<String> = candidate_chunks
-        .iter()
-        .map(|c| rank_text_for(c))
-        .collect();
-
-    let mut hits: Vec<Hit> = if rank_texts.len() > FRIZBEE_LIMIT {
+    let mut hits: Vec<Hit> = if candidate_chunks.len() > FRIZBEE_LIMIT {
         // Above the limit the cheap deterministic ranker is faster
         // and good enough — the report names this fallback exactly.
         // We still let filename-match docs through even when the
         // chunk text doesn't contain the query, so the "type part of
         // a filename" UX survives on large corpora; the snippet
         // anchors at offset 0 in that case.
+        //
+        // The cheap branch doesn't need the `rank_text_for(c)`
+        // strings the neo_frizbee branch builds, so we skip that
+        // pass entirely. We also break at `limit`: on a 1-char fuzzy
+        // query against a large corpus the bigram prefilter has no
+        // information and every chunk lands in `candidate_chunks`,
+        // so the early break is what keeps the first keystroke from
+        // doing N_chunks worth of unbounded work.
         let needle_norm = q_norm.as_bytes();
         let finder = memmem::Finder::new(needle_norm);
-        candidate_chunks
-            .iter()
-            .filter_map(|chunk| {
-                if let Some(pos) = finder.find(&chunk.text_norm_ascii) {
-                    Some(make_hit_at_norm(chunk, pos, needle_norm.len()))
-                } else if filename_match_docs.contains(&chunk.doc_id) {
-                    Some(make_hit_at_norm(chunk, 0, needle_norm.len()))
-                } else {
-                    None
-                }
-            })
-            .collect()
+        let mut hits: Vec<Hit> = Vec::with_capacity(limit.min(candidate_chunks.len()));
+        for chunk in &candidate_chunks {
+            let hit = if let Some(pos) = finder.find(&chunk.text_norm_ascii) {
+                make_hit_at_norm(chunk, pos, needle_norm.len())
+            } else if filename_match_docs.contains(&chunk.doc_id) {
+                make_hit_at_norm(chunk, 0, needle_norm.len())
+            } else {
+                continue;
+            };
+            hits.push(hit);
+            if hits.len() >= limit {
+                break;
+            }
+        }
+        hits
     } else {
+        // neo_frizbee needs one "rank string" per candidate; build it
+        // only here, since the cheap branch above doesn't use it.
+        let rank_texts: Vec<String> = candidate_chunks
+            .iter()
+            .map(|c| rank_text_for(c))
+            .collect();
         let config = neo_frizbee::Config {
             max_typos: None,
             sort: true,
@@ -331,7 +343,7 @@ fn fuzzy_search(state: &IndexState, query: &str, limit: usize) -> Result<Vec<Hit
         let mut hits: Vec<Hit> = Vec::with_capacity(matches.len());
         for m in &matches {
             let chunk = candidate_chunks[m.index as usize];
-            // Locate the user's query inside the rank text for snippet
+            // Locate the user's query inside the chunk text for snippet
             // purposes — best-effort. If neo_frizbee accepted the
             // candidate but the literal needle isn't present (the
             // fuzzy match crossed token boundaries), centre the
