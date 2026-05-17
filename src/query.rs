@@ -49,11 +49,11 @@
 
 use anyhow::{Context, Result};
 use memchr::memmem;
-use regex::Regex;
 use tracing::warn;
 
-use crate::bigram::{BigramIndex, extract_bigrams};
+use crate::bigram::extract_bigrams;
 use crate::bigram_query::{fuzzy_to_bigram_query, regex_to_bigram_query};
+use crate::bitset::Bitset;
 use crate::index::{BaseIndex, ChunkItem, IndexState, Overlay};
 use crate::normalize::{collapse_whitespace_for_display, normalize_query_ascii};
 
@@ -107,6 +107,77 @@ pub struct Hit {
     pub snippet: String,
 }
 
+/// Where a match was found inside a chunk.
+///
+/// The two variants exist because literal / fuzzy search locate matches
+/// in `text_norm_ascii` (the normalised byte string used for the bigram
+/// prefilter and `memchr`), while regex search locates them directly in
+/// `text_utf8` (the original UTF-8 the regex engine ran against). The
+/// snippet renderer needs to know which: an in-norm offset must be
+/// proportionally remapped to a byte offset in `text_utf8` because the
+/// two strings diverge after deunicode + lowercase + whitespace
+/// collapse; an in-utf8 offset is already exact.
+#[derive(Debug, Clone, Copy)]
+enum MatchLocation {
+    /// Byte offset within `text_norm_ascii`.
+    Norm { offset: usize, query_len: usize },
+    /// Byte offset within `text_utf8`.
+    Utf8 { offset: usize, match_len: usize },
+}
+
+/// Candidate set fed into the verification pass.
+///
+/// Either:
+/// * `Unconstrained` — the bigram prefilter had nothing to say (no
+///   bigrams in the query, or `BigramIndex::query` returned `None`).
+///   The verifier must visit every base chunk that isn't tombstoned.
+/// * `Restricted(Bitset)` — a bigram bitset already AND-NOTed with
+///   the overlay's tombstones at construction.
+///
+/// Hiding the two cases behind one type lets the base-walk be a single
+/// loop over `[0, base.chunks.len())` instead of two near-identical
+/// match arms.
+enum CandidateSet {
+    Unconstrained,
+    Restricted(Bitset),
+}
+
+impl CandidateSet {
+    /// Lift the bigram prefilter's `Option<Vec<u64>>` into a
+    /// [`CandidateSet`] sized to `base_chunk_count`.
+    ///
+    /// `None` ⇒ `Unconstrained`; `Some(words)` ⇒ `Restricted` over
+    /// exactly `base_chunk_count` bits, with the overlay's tombstones
+    /// masked out in the same step.
+    fn from_bigram_lookup(
+        lookup: Option<Vec<u64>>,
+        base_chunk_count: usize,
+        ov: &Overlay,
+    ) -> Self {
+        match lookup {
+            None => Self::Unconstrained,
+            Some(words) => {
+                let mut bits = Bitset::from_words(words, base_chunk_count);
+                bits.and_not_assign(&ov.tombstones);
+                Self::Restricted(bits)
+            }
+        }
+    }
+
+    /// Should chunk index `i` be visited by the verifier?
+    ///
+    /// `Restricted`: check the bitset. Tombstones are already masked
+    /// out at construction, so a single lookup suffices.
+    /// `Unconstrained`: skip tombstoned indices; everything else passes.
+    #[inline]
+    fn includes(&self, i: usize, ov: &Overlay) -> bool {
+        match self {
+            Self::Restricted(bits) => bits.get(i),
+            Self::Unconstrained => !ov.is_tombstoned(i),
+        }
+    }
+}
+
 /// Run `query` against the current `BaseIndex` snapshot.
 ///
 /// Contract:
@@ -146,11 +217,6 @@ fn literal_search(state: &IndexState, query: &str, limit: usize) -> Result<Vec<H
     let base = state.load_base();
     let ov = state.overlay.read();
 
-    let mut candidates: Option<Vec<u64>> = base
-        .bigrams
-        .as_ref()
-        .and_then(|idx| idx.query(needle));
-
     if needle.len() < NO_BIGRAM_FULLSCAN_WARN_LEN {
         warn!(
             len = needle.len(),
@@ -158,23 +224,21 @@ fn literal_search(state: &IndexState, query: &str, limit: usize) -> Result<Vec<H
         );
     }
 
-    apply_tombstones(&mut candidates, &ov);
+    let lookup = base.bigrams.as_ref().and_then(|idx| idx.query(needle));
+    let candidates = CandidateSet::from_bigram_lookup(lookup, base.chunks.len(), &ov);
+
+    let literal_verifier = |chunk: &ChunkItem| {
+        finder
+            .find(&chunk.text_norm_ascii)
+            .map(|offset| MatchLocation::Norm { offset, query_len: needle.len() })
+    };
 
     let mut hits: Vec<Hit> = Vec::new();
-    walk_base_for_literal(&base, &ov, candidates.as_deref(), &finder, needle.len(), limit, &mut hits);
+    walk_base_chunks(&base, &ov, &candidates, limit, &mut hits, &literal_verifier);
 
-    if hits.len() < limit && !ov.overflow_chunks.is_empty() {
+    if hits.len() < limit && !ov.overflow.is_empty() {
         let query_bigrams = extract_bigrams(needle);
-        for idx in ov.overflow_matches(&query_bigrams) {
-            let chunk = &ov.overflow_chunks[idx];
-            let Some(pos) = finder.find(&chunk.text_norm_ascii) else {
-                continue;
-            };
-            hits.push(make_hit_at_norm(chunk, pos, needle.len()));
-            if hits.len() >= limit {
-                break;
-            }
-        }
+        walk_overflow(&ov, ov.overflow_matches(&query_bigrams), limit, &mut hits, &literal_verifier);
     }
 
     // Stable (doc_id, page, chunk_id) ordering — needed when overflow
@@ -207,15 +271,21 @@ fn regex_search(state: &IndexState, pattern: &str, limit: usize) -> Result<Vec<H
     let base = state.load_base();
     let ov = state.overlay.read();
 
-    let mut candidates: Option<Vec<u64>> = if bq.is_any() {
+    let lookup = if bq.is_any() {
         None
     } else {
         base.bigrams.as_ref().and_then(|idx| bq.evaluate(idx))
     };
-    apply_tombstones(&mut candidates, &ov);
+    let candidates = CandidateSet::from_bigram_lookup(lookup, base.chunks.len(), &ov);
+
+    let regex_verifier = |chunk: &ChunkItem| {
+        regex
+            .find(&chunk.text_utf8)
+            .map(|m| MatchLocation::Utf8 { offset: m.start(), match_len: m.len() })
+    };
 
     let mut hits: Vec<Hit> = Vec::new();
-    walk_base_for_regex(&base, &ov, candidates.as_deref(), &regex, limit, &mut hits);
+    walk_base_chunks(&base, &ov, &candidates, limit, &mut hits, &regex_verifier);
 
     // Overlay overflow: conservatively check every row. Regex bigrams
     // don't always survive overlay-side bigram dedup, so we let the
@@ -223,14 +293,8 @@ fn regex_search(state: &IndexState, pattern: &str, limit: usize) -> Result<Vec<H
     // is bounded by the rebuild threshold, so the linear scan is
     // bounded too.
     if hits.len() < limit {
-        for chunk in &ov.overflow_chunks {
-            if let Some(m) = regex.find(&chunk.text_utf8) {
-                hits.push(make_hit_at_utf8(chunk, m.start(), m.len()));
-                if hits.len() >= limit {
-                    break;
-                }
-            }
-        }
+        let all_overflow: Vec<usize> = (0..ov.overflow.len()).collect();
+        walk_overflow(&ov, all_overflow, limit, &mut hits, &regex_verifier);
     }
 
     hits.sort_by_key(|h| (h.doc_id, h.page_no, h.chunk_id));
@@ -255,12 +319,12 @@ fn fuzzy_search(state: &IndexState, query: &str, limit: usize) -> Result<Vec<Hit
     let base = state.load_base();
     let ov = state.overlay.read();
 
-    let mut candidates: Option<Vec<u64>> = if bq.is_any() {
+    let lookup = if bq.is_any() {
         None
     } else {
         base.bigrams.as_ref().and_then(|idx| bq.evaluate(idx))
     };
-    apply_tombstones(&mut candidates, &ov);
+    let candidates = CandidateSet::from_bigram_lookup(lookup, base.chunks.len(), &ov);
 
     // Find docs whose filename *itself* matches the query, and union
     // their chunks into the candidate set. The chunk-text bigram
@@ -278,89 +342,106 @@ fn fuzzy_search(state: &IndexState, query: &str, limit: usize) -> Result<Vec<Hit
     // Gather candidate chunks — base passes through the bitset OR the
     // filename-match doc set, overflow chunks are unconditionally
     // appended (the fuzzy scorer makes the final call).
-    let mut candidate_chunks: Vec<&ChunkItem> = Vec::new();
-    collect_base_candidates_with_filename_docs(
-        &base,
-        &ov,
-        candidates.as_deref(),
-        &filename_match_docs,
-        &mut candidate_chunks,
-    );
-    for chunk in &ov.overflow_chunks {
-        candidate_chunks.push(chunk);
-    }
+    let candidate_chunks =
+        gather_fuzzy_candidates(&base, &ov, &candidates, &filename_match_docs);
 
     if candidate_chunks.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut hits: Vec<Hit> = if candidate_chunks.len() > FRIZBEE_LIMIT {
-        // Above the limit the cheap deterministic ranker is faster
-        // and good enough — the report names this fallback exactly.
-        // We still let filename-match docs through even when the
-        // chunk text doesn't contain the query, so the "type part of
-        // a filename" UX survives on large corpora; the snippet
-        // anchors at offset 0 in that case.
-        //
-        // The cheap branch doesn't need the `rank_text_for(c)`
-        // strings the neo_frizbee branch builds, so we skip that
-        // pass entirely. We also break at `limit`: on a 1-char fuzzy
-        // query against a large corpus the bigram prefilter has no
-        // information and every chunk lands in `candidate_chunks`,
-        // so the early break is what keeps the first keystroke from
-        // doing N_chunks worth of unbounded work.
-        let needle_norm = q_norm.as_bytes();
-        let finder = memmem::Finder::new(needle_norm);
-        let mut hits: Vec<Hit> = Vec::with_capacity(limit.min(candidate_chunks.len()));
-        for chunk in &candidate_chunks {
-            let hit = if let Some(pos) = finder.find(&chunk.text_norm_ascii) {
-                make_hit_at_norm(chunk, pos, needle_norm.len())
-            } else if filename_match_docs.contains(&chunk.doc_id) {
-                make_hit_at_norm(chunk, 0, needle_norm.len())
-            } else {
-                continue;
-            };
-            hits.push(hit);
-            if hits.len() >= limit {
-                break;
-            }
-        }
-        hits
+    let mut hits = if candidate_chunks.len() > FRIZBEE_LIMIT {
+        rank_fuzzy_cheap(&candidate_chunks, &q_norm, &filename_match_docs, limit)
     } else {
-        // neo_frizbee needs one "rank string" per candidate; build it
-        // only here, since the cheap branch above doesn't use it.
-        let rank_texts: Vec<String> = candidate_chunks
-            .iter()
-            .map(|c| rank_text_for(c))
-            .collect();
-        let config = neo_frizbee::Config {
-            max_typos: None,
-            sort: true,
-            scoring: neo_frizbee::Scoring::default(),
-        };
-        let matches =
-            neo_frizbee::match_list_parallel(&q_norm, &rank_texts, &config, FRIZBEE_THREADS);
-        let mut hits: Vec<Hit> = Vec::with_capacity(matches.len());
-        for m in &matches {
-            let chunk = candidate_chunks[m.index as usize];
-            // Locate the user's query inside the chunk text for snippet
-            // purposes — best-effort. If neo_frizbee accepted the
-            // candidate but the literal needle isn't present (the
-            // fuzzy match crossed token boundaries), centre the
-            // snippet on offset 0.
-            let pos = memmem::find(chunk.text_norm_ascii.as_ref(), q_norm.as_bytes())
-                .unwrap_or(0);
-            let mut hit = make_hit_at_norm(chunk, pos, q_norm.len());
-            // Carry neo_frizbee's score through so callers can rank
-            // across queries; the unit-of-score is u16 internally.
-            hit.score = m.score as f32;
-            hits.push(hit);
-        }
-        hits
+        rank_fuzzy_frizbee(&candidate_chunks, &q_norm)
     };
 
     hits.truncate(limit);
     Ok(hits)
+}
+
+/// Base chunks surviving the bigram prefilter (or belonging to a
+/// filename-matched doc), followed by every overflow chunk.
+fn gather_fuzzy_candidates<'a>(
+    base: &'a BaseIndex,
+    ov: &'a Overlay,
+    candidates: &CandidateSet,
+    filename_match_docs: &std::collections::HashSet<i64>,
+) -> Vec<&'a ChunkItem> {
+    let mut out: Vec<&'a ChunkItem> = Vec::new();
+    for (i, chunk) in base.chunks.iter().enumerate() {
+        if ov.is_tombstoned(i) {
+            continue;
+        }
+        if candidates.includes(i, ov) || filename_match_docs.contains(&chunk.doc_id) {
+            out.push(chunk);
+        }
+    }
+    for chunk in ov.overflow.chunks() {
+        out.push(chunk);
+    }
+    out
+}
+
+/// Cheap deterministic ordering used when the candidate set exceeds
+/// [`FRIZBEE_LIMIT`]. The report names this fallback exactly: on a
+/// 1-char fuzzy query against a large corpus the prefilter has no
+/// information and every chunk is a candidate, so the early break at
+/// `limit` is what keeps the first keystroke bounded.
+fn rank_fuzzy_cheap(
+    candidate_chunks: &[&ChunkItem],
+    q_norm: &str,
+    filename_match_docs: &std::collections::HashSet<i64>,
+    limit: usize,
+) -> Vec<Hit> {
+    let needle_norm = q_norm.as_bytes();
+    let finder = memmem::Finder::new(needle_norm);
+    let mut hits: Vec<Hit> = Vec::with_capacity(limit.min(candidate_chunks.len()));
+    for chunk in candidate_chunks {
+        let loc = if let Some(offset) = finder.find(&chunk.text_norm_ascii) {
+            MatchLocation::Norm { offset, query_len: needle_norm.len() }
+        } else if filename_match_docs.contains(&chunk.doc_id) {
+            // Filename-only match: anchor the snippet at offset 0.
+            MatchLocation::Norm { offset: 0, query_len: needle_norm.len() }
+        } else {
+            continue;
+        };
+        hits.push(make_hit(chunk, loc));
+        if hits.len() >= limit {
+            break;
+        }
+    }
+    hits
+}
+
+/// Score with `neo_frizbee` over the full candidate set.
+fn rank_fuzzy_frizbee(candidate_chunks: &[&ChunkItem], q_norm: &str) -> Vec<Hit> {
+    // neo_frizbee needs one "rank string" per candidate; we only build
+    // these on the frizbee path because the cheap fallback doesn't use
+    // them.
+    let rank_texts: Vec<String> = candidate_chunks.iter().map(|c| rank_text_for(c)).collect();
+    let config = neo_frizbee::Config {
+        max_typos: None,
+        sort: true,
+        scoring: neo_frizbee::Scoring::default(),
+    };
+    let matches =
+        neo_frizbee::match_list_parallel(q_norm, &rank_texts, &config, FRIZBEE_THREADS);
+    let mut hits: Vec<Hit> = Vec::with_capacity(matches.len());
+    for m in &matches {
+        let chunk = candidate_chunks[m.index as usize];
+        // Locate the user's query inside the chunk text for snippet
+        // purposes — best-effort. If neo_frizbee accepted the
+        // candidate but the literal needle isn't present (the fuzzy
+        // match crossed token boundaries), centre the snippet on
+        // offset 0.
+        let offset = memmem::find(chunk.text_norm_ascii.as_ref(), q_norm.as_bytes()).unwrap_or(0);
+        let mut hit = make_hit(chunk, MatchLocation::Norm { offset, query_len: q_norm.len() });
+        // Carry neo_frizbee's score through so callers can rank across
+        // queries; the unit-of-score is u16 internally.
+        hit.score = m.score as f32;
+        hits.push(hit);
+    }
+    hits
 }
 
 /// Build the synthetic "rank string" passed to the fuzzy scorer. Mirrors
@@ -379,122 +460,54 @@ fn rank_text_for(c: &ChunkItem) -> String {
     s
 }
 
-/// AND-NOT the overlay's tombstone bitset into a candidate bitset.
-fn apply_tombstones(candidates: &mut Option<Vec<u64>>, ov: &Overlay) {
-    if let Some(ref mut bitset) = candidates {
-        let n = bitset.len().min(ov.tombstones.len());
-        for w in 0..n {
-            bitset[w] &= !ov.tombstones[w];
-        }
-    }
-}
-
-fn walk_base_for_literal(
-    base: &BaseIndex,
-    ov: &Overlay,
-    candidates: Option<&[u64]>,
-    finder: &memmem::Finder,
-    needle_len: usize,
-    limit: usize,
-    hits: &mut Vec<Hit>,
-) {
-    match candidates {
-        Some(bitset) => {
-            for (i, chunk) in base.chunks.iter().enumerate() {
-                if !BigramIndex::is_candidate(bitset, i) {
-                    continue;
-                }
-                let Some(pos) = finder.find(&chunk.text_norm_ascii) else {
-                    continue;
-                };
-                hits.push(make_hit_at_norm(chunk, pos, needle_len));
-                if hits.len() >= limit {
-                    break;
-                }
-            }
-        }
-        None => {
-            for (i, chunk) in base.chunks.iter().enumerate() {
-                if ov.is_tombstoned(i) {
-                    continue;
-                }
-                let Some(pos) = finder.find(&chunk.text_norm_ascii) else {
-                    continue;
-                };
-                hits.push(make_hit_at_norm(chunk, pos, needle_len));
-                if hits.len() >= limit {
-                    break;
-                }
-            }
-        }
-    }
-}
-
-fn walk_base_for_regex(
-    base: &BaseIndex,
-    ov: &Overlay,
-    candidates: Option<&[u64]>,
-    regex: &Regex,
-    limit: usize,
-    hits: &mut Vec<Hit>,
-) {
-    match candidates {
-        Some(bitset) => {
-            for (i, chunk) in base.chunks.iter().enumerate() {
-                if !BigramIndex::is_candidate(bitset, i) {
-                    continue;
-                }
-                let Some(m) = regex.find(&chunk.text_utf8) else {
-                    continue;
-                };
-                hits.push(make_hit_at_utf8(chunk, m.start(), m.len()));
-                if hits.len() >= limit {
-                    break;
-                }
-            }
-        }
-        None => {
-            for (i, chunk) in base.chunks.iter().enumerate() {
-                if ov.is_tombstoned(i) {
-                    continue;
-                }
-                let Some(m) = regex.find(&chunk.text_utf8) else {
-                    continue;
-                };
-                hits.push(make_hit_at_utf8(chunk, m.start(), m.len()));
-                if hits.len() >= limit {
-                    break;
-                }
-            }
-        }
-    }
-}
-
-/// Walk the base chunks and push every chunk that either survives the
-/// bigram prefilter *or* belongs to a doc in `filename_match_docs`.
-/// Tombstoned base chunks are always hidden.
+/// Walk the base chunks, applying `verify` to each survivor of the
+/// candidate set. Stops once `hits` reaches `limit`.
 ///
-/// Used by the fuzzy path so that a query matching only a paper's
-/// filename (and not the body text) still surfaces the paper. Pass an
-/// empty `filename_match_docs` to get the strict bigram-prefilter
-/// behaviour.
-fn collect_base_candidates_with_filename_docs<'a>(
-    base: &'a BaseIndex,
+/// The two-arm `Some(bitset)` / `None` pyramid the search functions
+/// used to carry collapses to one loop here; the asymmetry between
+/// "have prefilter" and "no prefilter" is encapsulated by
+/// [`CandidateSet::includes`].
+fn walk_base_chunks<F>(
+    base: &BaseIndex,
     ov: &Overlay,
-    candidates: Option<&[u64]>,
-    filename_match_docs: &std::collections::HashSet<i64>,
-    out: &mut Vec<&'a ChunkItem>,
-) {
+    candidates: &CandidateSet,
+    limit: usize,
+    hits: &mut Vec<Hit>,
+    verify: F,
+) where
+    F: Fn(&ChunkItem) -> Option<MatchLocation>,
+{
     for (i, chunk) in base.chunks.iter().enumerate() {
-        if ov.is_tombstoned(i) {
+        if !candidates.includes(i, ov) {
             continue;
         }
-        let bigram_ok = match candidates {
-            Some(bitset) => BigramIndex::is_candidate(bitset, i),
-            None => true,
-        };
-        if bigram_ok || filename_match_docs.contains(&chunk.doc_id) {
-            out.push(chunk);
+        if let Some(loc) = verify(chunk) {
+            hits.push(make_hit(chunk, loc));
+            if hits.len() >= limit {
+                break;
+            }
+        }
+    }
+}
+
+/// Same as [`walk_base_chunks`] over a list of overflow indices.
+fn walk_overflow<F>(
+    ov: &Overlay,
+    indices: Vec<usize>,
+    limit: usize,
+    hits: &mut Vec<Hit>,
+    verify: F,
+) where
+    F: Fn(&ChunkItem) -> Option<MatchLocation>,
+{
+    let chunks = ov.overflow.chunks();
+    for idx in indices {
+        let chunk = &chunks[idx];
+        if let Some(loc) = verify(chunk) {
+            hits.push(make_hit(chunk, loc));
+            if hits.len() >= limit {
+                break;
+            }
         }
     }
 }
@@ -540,7 +553,8 @@ fn docs_with_filename_match(
     out
 }
 
-fn make_hit_at_norm(chunk: &ChunkItem, match_offset_in_norm: usize, query_len: usize) -> Hit {
+/// Construct a [`Hit`] for `chunk` with its snippet anchored at `loc`.
+fn make_hit(chunk: &ChunkItem, loc: MatchLocation) -> Hit {
     Hit {
         chunk_id: chunk.chunk_id,
         doc_id: chunk.doc_id,
@@ -549,23 +563,7 @@ fn make_hit_at_norm(chunk: &ChunkItem, match_offset_in_norm: usize, query_len: u
         page_no: chunk.page_no,
         chunk_ord: chunk.chunk_ord,
         score: 1.0,
-        snippet: render_snippet(chunk, match_offset_in_norm, query_len),
-    }
-}
-
-fn make_hit_at_utf8(chunk: &ChunkItem, match_offset_in_utf8: usize, query_len: usize) -> Hit {
-    // For regex hits we know the *exact* UTF-8 offset, so we can render
-    // the snippet without going through the proportional norm→utf8
-    // remapping.
-    Hit {
-        chunk_id: chunk.chunk_id,
-        doc_id: chunk.doc_id,
-        path: chunk.path.to_string(),
-        filename: chunk.filename.to_string(),
-        page_no: chunk.page_no,
-        chunk_ord: chunk.chunk_ord,
-        score: 1.0,
-        snippet: render_snippet_at_utf8(chunk, match_offset_in_utf8, query_len),
+        snippet: render_snippet(chunk, loc),
     }
 }
 
@@ -632,41 +630,30 @@ pub fn cheap_rank(hits: &mut Vec<Hit>, query_norm: &str) {
     *hits = reordered;
 }
 
-/// Build a short snippet around the approximate UTF-8 location of the
-/// match. See the module-level docs for why this is best-effort.
-pub fn render_snippet(
-    chunk: &ChunkItem,
-    match_offset_in_norm: usize,
-    query_len: usize,
-) -> String {
+/// Build a short snippet around `loc` inside `chunk.text_utf8`.
+///
+/// For [`MatchLocation::Norm`] offsets the function proportionally
+/// remaps the `text_norm_ascii` offset to a `text_utf8` byte offset:
+/// the two strings diverge after deunicode + lowercase + whitespace
+/// collapse, so the remap is best-effort. For [`MatchLocation::Utf8`]
+/// the offset is used directly. See the module-level docs.
+fn render_snippet(chunk: &ChunkItem, loc: MatchLocation) -> String {
     let text = &*chunk.text_utf8;
     if text.is_empty() {
         return String::new();
     }
-
-    let norm_len = chunk.text_norm_ascii.len();
-    let approx_byte = if norm_len == 0 {
-        0
-    } else {
-        let ratio = match_offset_in_norm as f64 / norm_len as f64;
-        ((text.len() as f64) * ratio).round() as usize
+    let (centre, match_len) = match loc {
+        MatchLocation::Norm { offset, query_len } => {
+            let norm_len = chunk.text_norm_ascii.len();
+            let approx_byte = if norm_len == 0 {
+                0
+            } else {
+                ((text.len() as f64) * (offset as f64 / norm_len as f64)).round() as usize
+            };
+            (approx_byte.min(text.len()), query_len)
+        }
+        MatchLocation::Utf8 { offset, match_len } => (offset.min(text.len()), match_len),
     };
-    let approx_byte = approx_byte.min(text.len());
-    render_window(text, approx_byte, query_len)
-}
-
-/// Same as [`render_snippet`] but takes an exact UTF-8 offset. Used by
-/// the regex path where we already know the byte offset of the match.
-pub fn render_snippet_at_utf8(
-    chunk: &ChunkItem,
-    match_offset_in_utf8: usize,
-    match_len: usize,
-) -> String {
-    let text = &*chunk.text_utf8;
-    if text.is_empty() {
-        return String::new();
-    }
-    let centre = match_offset_in_utf8.min(text.len());
     render_window(text, centre, match_len)
 }
 

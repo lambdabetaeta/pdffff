@@ -510,50 +510,7 @@ fn writer_thread(
 ) -> Result<()> {
     let mut db = Db::open(&db_path).context("writer thread: opening SQLite")?;
     while let Ok(msg) = rx.recv() {
-        let mutated = match msg {
-            WriterMsg::Doc(doc) => {
-                let status = doc.status;
-                let path = doc.path.clone();
-                match db.upsert_extracted(&doc) {
-                    Ok(doc_id) => {
-                        match status {
-                            DocStatus::Ok => &counters.ok,
-                            DocStatus::Empty => &counters.empty,
-                            DocStatus::Error => &counters.error,
-                            DocStatus::Deleted => &counters.deleted,
-                        }
-                        .fetch_add(1, Ordering::Relaxed);
-
-                        if let Err(err) = apply_overlay_for_upsert(&db, &live_state, doc_id) {
-                            warn!(path = %path.display(), ?err, "applying overlay update");
-                        }
-                        true
-                    }
-                    Err(err) => {
-                        warn!(path = %path.display(), ?err, "upsert_extracted failed");
-                        counters.error.fetch_add(1, Ordering::Relaxed);
-                        false
-                    }
-                }
-            }
-            WriterMsg::Delete(path) => match db.mark_deleted(&path) {
-                Ok(Some(doc_id)) => {
-                    counters.deleted.fetch_add(1, Ordering::Relaxed);
-                    let base = live_state.load_base();
-                    let mut ov = live_state.overlay.write();
-                    ov.tombstone_doc(doc_id, &base);
-                    true
-                }
-                Ok(None) => {
-                    // Path wasn't known to the DB — nothing to tombstone.
-                    false
-                }
-                Err(err) => {
-                    warn!(path = %path.display(), ?err, "mark_deleted failed");
-                    false
-                }
-            },
-        };
+        let mutated = process_writer_msg(&mut db, &live_state, &counters, msg);
 
         // After each mutation that touched the overlay, check the
         // rebuild thresholds. The check itself is cheap (one stats
@@ -577,6 +534,75 @@ fn writer_thread(
         }
     }
     Ok(())
+}
+
+/// Apply one [`WriterMsg`] to the DB and the live overlay.
+///
+/// Returns `true` if the overlay was mutated (so the writer loop knows
+/// to re-check the rebuild thresholds), `false` otherwise. Failures are
+/// logged and folded into the `false` branch — the writer keeps running
+/// so one bad row can't take down the indexer.
+fn process_writer_msg(
+    db: &mut Db,
+    state: &IndexState,
+    counters: &IndexProgress,
+    msg: WriterMsg,
+) -> bool {
+    match msg {
+        WriterMsg::Doc(doc) => apply_doc(db, state, counters, *doc),
+        WriterMsg::Delete(path) => apply_delete(db, state, counters, &path),
+    }
+}
+
+fn apply_doc(db: &mut Db, state: &IndexState, counters: &IndexProgress, doc: ExtractedDoc) -> bool {
+    let status = doc.status;
+    let path = doc.path.clone();
+    match db.upsert_extracted(&doc) {
+        Ok(doc_id) => {
+            counter_for(counters, status).fetch_add(1, Ordering::Relaxed);
+            if let Err(err) = apply_overlay_for_upsert(db, state, doc_id) {
+                warn!(path = %path.display(), ?err, "applying overlay update");
+            }
+            true
+        }
+        Err(err) => {
+            warn!(path = %path.display(), ?err, "upsert_extracted failed");
+            counters.error.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+fn apply_delete(db: &mut Db, state: &IndexState, counters: &IndexProgress, path: &Path) -> bool {
+    match db.mark_deleted(path) {
+        Ok(Some(doc_id)) => {
+            counters.deleted.fetch_add(1, Ordering::Relaxed);
+            let base = state.load_base();
+            let mut ov = state.overlay.write();
+            ov.tombstone_doc(doc_id, &base);
+            true
+        }
+        // Path wasn't known to the DB — nothing to tombstone.
+        Ok(None) => false,
+        Err(err) => {
+            warn!(path = %path.display(), ?err, "mark_deleted failed");
+            false
+        }
+    }
+}
+
+/// Counter inside [`IndexProgress`] corresponding to `status`.
+///
+/// Centralising the dispatch means a future `DocStatus` variant has
+/// exactly one place to consider; the writer thread itself never sees
+/// the mapping.
+fn counter_for(counters: &IndexProgress, status: DocStatus) -> &AtomicUsize {
+    match status {
+        DocStatus::Ok => &counters.ok,
+        DocStatus::Empty => &counters.empty,
+        DocStatus::Error => &counters.error,
+        DocStatus::Deleted => &counters.deleted,
+    }
 }
 
 /// After the writer has UPSERTed `doc_id`, fetch the freshly active

@@ -35,6 +35,7 @@
 pub mod app;
 pub mod bigram;
 pub mod bigram_query;
+pub mod bitset;
 pub mod db;
 pub mod extract;
 pub mod index;

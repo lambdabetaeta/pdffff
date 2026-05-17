@@ -40,6 +40,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 use crate::bigram::{BigramIndex, build_bigram_index_from_chunks, extract_bigrams};
+use crate::bitset::Bitset;
 use crate::db::Db;
 
 /// Trigger a base rebuild when the overflow list grows beyond this many
@@ -109,19 +110,108 @@ impl BaseIndex {
     }
 }
 
+/// Per-chunk side of the overlay: chunks published since the last base
+/// rebuild, paired with their deduped & sorted bigram set so the
+/// per-query prefilter is a small binary-search loop rather than a
+/// linear scan.
+///
+/// The two underlying vectors are wrapped together because they share
+/// one invariant — `chunks[i]` and `bigrams[i]` must always refer to
+/// the same row. Every mutating method on [`OverflowSet`] preserves
+/// that invariant, so callers cannot drift them out of sync.
+#[derive(Debug, Default)]
+pub struct OverflowSet {
+    chunks: Vec<ChunkItem>,
+    /// Deduped, sorted bigram set for `chunks[i]`. Sorting once at
+    /// insert lets [`OverflowSet::matches`] use `binary_search` so the
+    /// per-chunk check is O(Q · log C) rather than O(Q · C).
+    bigrams: Vec<Vec<u16>>,
+}
+
+impl OverflowSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.chunks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    pub fn chunks(&self) -> &[ChunkItem] {
+        &self.chunks
+    }
+
+    /// Add `chunk`. Extracts and sorts its bigrams in the same step,
+    /// so the row enters with both its slots populated.
+    pub fn push(&mut self, chunk: ChunkItem) {
+        let mut bg = extract_bigrams(chunk.text_norm_ascii.as_ref());
+        bg.sort_unstable();
+        self.chunks.push(chunk);
+        self.bigrams.push(bg);
+    }
+
+    /// Drop every row whose chunk belongs to `doc_id`.
+    ///
+    /// Two-pointer compact: O(n) time, no allocations beyond the
+    /// truncation. The chunk and bigram vectors stay aligned because
+    /// the same swap pattern drives both.
+    pub fn drop_doc(&mut self, doc_id: i64) {
+        let mut write = 0;
+        for read in 0..self.chunks.len() {
+            if self.chunks[read].doc_id != doc_id {
+                if write != read {
+                    self.chunks.swap(write, read);
+                    self.bigrams.swap(write, read);
+                }
+                write += 1;
+            }
+        }
+        self.chunks.truncate(write);
+        self.bigrams.truncate(write);
+    }
+
+    /// Reset to empty.
+    pub fn clear(&mut self) {
+        self.chunks.clear();
+        self.bigrams.clear();
+    }
+
+    /// Return indices whose deduped bigram set contains every entry of
+    /// `query_bigrams`.
+    ///
+    /// `query_bigrams` may be in any order. The per-chunk side is
+    /// sorted at insert time so each `contains` check is a binary
+    /// search. An empty query bigram slice returns every row (the
+    /// prefilter has nothing to say).
+    pub fn matches(&self, query_bigrams: &[u16]) -> Vec<usize> {
+        if query_bigrams.is_empty() {
+            return (0..self.chunks.len()).collect();
+        }
+        let mut out = Vec::new();
+        for (i, bg) in self.bigrams.iter().enumerate() {
+            if query_bigrams.iter().all(|q| bg.binary_search(q).is_ok()) {
+                out.push(i);
+            }
+        }
+        out
+    }
+}
+
 /// Mutable overlay applied on top of [`BaseIndex`] between rebuilds.
 ///
 /// * `tombstones` hides stale base chunks by *index into `BaseIndex.chunks`*.
 ///   Each bit covers one base chunk; set ⇒ the chunk is logically deleted
 ///   from the active corpus (the query path AND-NOTs this against its
 ///   candidate bitset).
-/// * `overflow_chunks` carries new/modified chunks since the last base
-///   rebuild. They live in `Vec<ChunkItem>` order — the overlay itself
-///   does not impose any (doc_id, chunk_ord) ordering, so callers that
-///   need a stable ordering must sort hits at the call site.
-/// * `overflow_bigrams[i]` is the deduped bigram set of
-///   `overflow_chunks[i].text_norm_ascii`, computed once on insert so
-///   the query path doesn't re-extract bigrams per query.
+/// * `overflow` carries new/modified chunks since the last base
+///   rebuild, together with their sorted bigram sets. The order is
+///   insertion-order — the overlay does not impose any
+///   (doc_id, chunk_ord) ordering, so callers that need a stable
+///   ordering must sort hits at the call site.
 /// * `changed_docs` records every `doc_id` that currently has an
 ///   overlay entry (a tombstone, an overflow row, or both). This is
 ///   the set Day-6 rebuild will need to drop from the base.
@@ -129,9 +219,8 @@ impl BaseIndex {
 ///   query path doesn't rely on it for correctness because it holds
 ///   the read lock across both verification passes.
 pub struct Overlay {
-    pub tombstones: Vec<u64>,
-    pub overflow_chunks: Vec<ChunkItem>,
-    pub overflow_bigrams: Vec<Vec<u16>>,
+    pub tombstones: Bitset,
+    pub overflow: OverflowSet,
     pub changed_docs: HashSet<i64>,
     pub generation: u64,
 }
@@ -150,9 +239,8 @@ impl Overlay {
     /// Build an empty overlay sized to track `base_chunk_count` tombstones.
     pub fn new(base_chunk_count: usize) -> Self {
         Self {
-            tombstones: vec![0u64; words_for(base_chunk_count)],
-            overflow_chunks: Vec::new(),
-            overflow_bigrams: Vec::new(),
+            tombstones: Bitset::zeros(base_chunk_count),
+            overflow: OverflowSet::new(),
             changed_docs: HashSet::new(),
             generation: 0,
         }
@@ -164,10 +252,8 @@ impl Overlay {
 
     /// Tombstone a single base chunk by its index into `BaseIndex.chunks`.
     pub fn tombstone_index(&mut self, base_idx: usize) {
-        let word = base_idx / 64;
-        let bit = 1u64 << (base_idx % 64);
-        if word >= self.tombstones.len() {
-            // The tombstone vector was sized to the base at construction
+        if base_idx >= self.tombstones.len() {
+            // The tombstone bitset was sized to the base at construction
             // time. A base_idx outside that range is a caller bug.
             tracing::warn!(
                 base_idx,
@@ -176,26 +262,31 @@ impl Overlay {
             );
             return;
         }
-        self.tombstones[word] |= bit;
+        self.tombstones.set(base_idx);
         self.generation += 1;
     }
 
     /// Is this base chunk hidden by the overlay?
     #[inline]
     pub fn is_tombstoned(&self, base_idx: usize) -> bool {
-        let word = base_idx / 64;
-        let bit = 1u64 << (base_idx % 64);
-        word < self.tombstones.len() && self.tombstones[word] & bit != 0
+        self.tombstones.get(base_idx)
     }
 
     /// Push a new chunk into the overflow set, recording its bigrams
     /// and its parent doc.
     pub fn add_overflow(&mut self, chunk: ChunkItem) {
-        let bigrams = extract_bigrams(chunk.text_norm_ascii.as_ref());
         self.changed_docs.insert(chunk.doc_id);
-        self.overflow_chunks.push(chunk);
-        self.overflow_bigrams.push(bigrams);
+        self.overflow.push(chunk);
         self.generation += 1;
+    }
+
+    /// Tombstone every base chunk that belongs to `doc_id`.
+    fn tombstone_doc_in_base(&mut self, doc_id: i64, base: &BaseIndex) {
+        if let Some(range) = base.doc_ranges.get(&doc_id) {
+            for idx in range.clone() {
+                self.tombstones.set(idx);
+            }
+        }
     }
 
     /// Tombstone every base chunk that belongs to `doc_id`, and drop
@@ -206,36 +297,8 @@ impl Overlay {
     /// modification's chunks visible. The combined operation is
     /// atomic under the caller's write lock.
     pub fn tombstone_doc(&mut self, doc_id: i64, base: &BaseIndex) {
-        if let Some(range) = base.doc_ranges.get(&doc_id) {
-            for idx in range.clone() {
-                let word = idx / 64;
-                let bit = 1u64 << (idx % 64);
-                if word < self.tombstones.len() {
-                    self.tombstones[word] |= bit;
-                }
-            }
-        }
-        // Drop overflow rows for the same doc. We rebuild both vectors
-        // in lockstep so `overflow_chunks[i]` continues to align with
-        // `overflow_bigrams[i]`.
-        if !self.overflow_chunks.is_empty() {
-            let mut new_chunks: Vec<ChunkItem> =
-                Vec::with_capacity(self.overflow_chunks.len());
-            let mut new_bigrams: Vec<Vec<u16>> =
-                Vec::with_capacity(self.overflow_bigrams.len());
-            let pairs = std::mem::take(&mut self.overflow_chunks)
-                .into_iter()
-                .zip(std::mem::take(&mut self.overflow_bigrams));
-            for (chunk, bigrams) in pairs {
-                if chunk.doc_id == doc_id {
-                    continue;
-                }
-                new_chunks.push(chunk);
-                new_bigrams.push(bigrams);
-            }
-            self.overflow_chunks = new_chunks;
-            self.overflow_bigrams = new_bigrams;
-        }
+        self.tombstone_doc_in_base(doc_id, base);
+        self.overflow.drop_doc(doc_id);
         self.changed_docs.insert(doc_id);
         self.generation += 1;
     }
@@ -260,51 +323,31 @@ impl Overlay {
     /// rebuilt and the swap is published — the new base already
     /// includes everything the overlay was tracking.
     pub fn clear(&mut self) {
-        self.tombstones.clear();
-        self.overflow_chunks.clear();
-        self.overflow_bigrams.clear();
+        self.tombstones = Bitset::zeros(0);
+        self.overflow.clear();
         self.changed_docs.clear();
         self.generation = 0;
     }
 
-    /// Return the indices into `overflow_chunks` whose deduped bigram
-    /// set contains every bigram in `query_bigrams`.
+    /// Indices into `overflow.chunks()` whose deduped bigram set
+    /// contains every entry of `query_bigrams`.
     ///
-    /// Mirrors fff's `query_modified` overlay scan: bigram-level
-    /// containment is a sound and cheap prefilter; the literal /
-    /// regex verifier downstream is still the source of truth.
-    /// An empty `query_bigrams` slice returns every overflow index
-    /// (the prefilter has nothing to say, so every row is a
-    /// candidate).
+    /// Thin convenience over [`OverflowSet::matches`] so callers don't
+    /// have to reach through the field.
     pub fn overflow_matches(&self, query_bigrams: &[u16]) -> Vec<usize> {
-        if query_bigrams.is_empty() {
-            return (0..self.overflow_chunks.len()).collect();
-        }
-        let mut out = Vec::new();
-        for (idx, bigrams) in self.overflow_bigrams.iter().enumerate() {
-            // `extract_bigrams` returns first-seen order without
-            // dupes, so we can use a tiny set-membership check.
-            if query_bigrams.iter().all(|q| bigrams.contains(q)) {
-                out.push(idx);
-            }
-        }
-        out
+        self.overflow.matches(query_bigrams)
     }
 
     pub fn stats(&self) -> OverlayStats {
-        let tombstones: usize = self
-            .tombstones
-            .iter()
-            .map(|w| w.count_ones() as usize)
-            .sum();
-        // `tombstones.len() * 64` over-counts when the last word is
-        // partial; for ratio purposes that bias is at most one word
-        // (≤ 64 chunks) and harmless on any nontrivial corpus.
-        let total = (self.tombstones.len() * 64).max(1);
+        let tombstones = self.tombstones.count_ones();
+        // Use the logical bit length, not the word-aligned capacity, so
+        // a corpus of `64 + 1` chunks gets a ratio against the true
+        // chunk count.
+        let total = self.tombstones.len().max(1);
         let tombstone_ratio = tombstones as f64 / total as f64;
         OverlayStats {
             tombstones,
-            overflow_chunks: self.overflow_chunks.len(),
+            overflow_chunks: self.overflow.len(),
             generation: self.generation,
             tombstone_ratio,
         }
@@ -315,12 +358,6 @@ impl Default for Overlay {
     fn default() -> Self {
         Self::new(0)
     }
-}
-
-/// `tombstones.len()` for a base index of `n` chunks.
-#[inline]
-fn words_for(n: usize) -> usize {
-    n.div_ceil(64)
 }
 
 /// The handle the rest of the system reads from: an [`ArcSwap`] over
@@ -432,8 +469,8 @@ pub fn rebuild_from_db(state: &IndexState, db: &Db) -> Result<()> {
         // pair where stale_overlay's tombstones index into the
         // previous base layout.
         let mut ov = state.overlay.write();
-        prev_overflow = ov.overflow_chunks.len();
-        prev_tombstones = ov.tombstones.iter().map(|w| w.count_ones() as usize).sum::<usize>();
+        prev_overflow = ov.overflow.len();
+        prev_tombstones = ov.tombstones.count_ones();
         prev_generation = ov.generation;
         state.base.store(Arc::new(new_base));
         *ov = Overlay::new(new_chunk_count);
@@ -734,14 +771,13 @@ mod tests {
         ov.add_overflow(mk_chunk(101, 2, "new doc 2 chunk two"));
         // Also publish one for doc 3 — must survive.
         ov.add_overflow(mk_chunk(200, 3, "doc 3 overflow"));
-        assert_eq!(ov.overflow_chunks.len(), 3);
+        assert_eq!(ov.overflow.len(), 3);
 
         // Now tombstone doc 2 — its previous overflow rows must go,
         // doc 3's must stay.
         ov.tombstone_doc(2, &base);
-        assert_eq!(ov.overflow_chunks.len(), 1);
-        assert_eq!(ov.overflow_chunks[0].doc_id, 3);
-        assert_eq!(ov.overflow_bigrams.len(), 1);
+        assert_eq!(ov.overflow.len(), 1);
+        assert_eq!(ov.overflow.chunks()[0].doc_id, 3);
         // Doc 2's base range must now be tombstoned.
         assert!(ov.is_tombstoned(2));
         assert!(ov.is_tombstoned(3));
@@ -764,10 +800,9 @@ mod tests {
         assert!(ov.is_tombstoned(1));
         // Overflow now carries the two new chunks for doc 1, in
         // insertion order.
-        assert_eq!(ov.overflow_chunks.len(), 2);
-        assert_eq!(ov.overflow_chunks[0].chunk_id, 500);
-        assert_eq!(ov.overflow_chunks[1].chunk_id, 501);
-        assert_eq!(ov.overflow_bigrams.len(), 2);
+        assert_eq!(ov.overflow.len(), 2);
+        assert_eq!(ov.overflow.chunks()[0].chunk_id, 500);
+        assert_eq!(ov.overflow.chunks()[1].chunk_id, 501);
         // And `changed_docs` lists the touched doc.
         assert!(ov.changed_docs.contains(&1));
     }
@@ -782,17 +817,17 @@ mod tests {
 
         let first = vec![mk_chunk(700, 3, "first revision")];
         ov.modify_doc(3, first, &base);
-        assert_eq!(ov.overflow_chunks.len(), 1);
-        assert_eq!(ov.overflow_chunks[0].chunk_id, 700);
+        assert_eq!(ov.overflow.len(), 1);
+        assert_eq!(ov.overflow.chunks()[0].chunk_id, 700);
 
         let second = vec![
             mk_chunk(701, 3, "second revision one"),
             mk_chunk(702, 3, "second revision two"),
         ];
         ov.modify_doc(3, second, &base);
-        assert_eq!(ov.overflow_chunks.len(), 2);
-        assert!(ov.overflow_chunks.iter().all(|c| c.doc_id == 3));
-        let ids: Vec<i64> = ov.overflow_chunks.iter().map(|c| c.chunk_id).collect();
+        assert_eq!(ov.overflow.len(), 2);
+        assert!(ov.overflow.chunks().iter().all(|c| c.doc_id == 3));
+        let ids: Vec<i64> = ov.overflow.chunks().iter().map(|c| c.chunk_id).collect();
         assert_eq!(ids, vec![701, 702]);
     }
 
@@ -827,11 +862,10 @@ mod tests {
         ov.tombstone_doc(2, &base);
         assert!(!ov.is_empty());
         ov.clear();
-        assert!(ov.overflow_chunks.is_empty());
-        assert!(ov.overflow_bigrams.is_empty());
+        assert!(ov.overflow.is_empty());
         assert!(ov.changed_docs.is_empty());
         assert_eq!(ov.generation, 0);
-        // After `clear`, the tombstone vector is empty — the next
+        // After `clear`, the tombstone bitset is empty — the next
         // base index will reset it via `Overlay::new`. Until then no
         // index is in range.
         for i in 0..base.chunks.len() {
