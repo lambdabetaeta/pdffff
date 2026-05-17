@@ -116,6 +116,24 @@ const HL_FG: Color = Color::Black;
 /// Background used for matched query substrings inside snippets.
 const HL_BG: Color = Color::Yellow;
 
+/// Pick a foreground that reads against a coloured pill background on
+/// both light and dark terminal themes.
+///
+/// `Color::Black` looked sharp on a paper-white terminal but vanished
+/// on dark themes where the user's "black" is mapped close to the
+/// terminal background; `Color::White` is the inverse trap on yellow.
+/// We pick per-background and never rely on `Modifier::BOLD` to do
+/// double duty as a brightness hint (some terminals interpret bold as
+/// "lighten the foreground", which moves black toward grey on cyan).
+fn pill_fg_for(bg: Color) -> Color {
+    match bg {
+        // Bright / pale backgrounds need dark text.
+        Color::Yellow | Color::LightYellow | Color::White | Color::Gray => Color::Black,
+        // Saturated / dark backgrounds need bright text.
+        _ => Color::White,
+    }
+}
+
 /// Knobs for [`run_tui`]. The defaults are sensible for an interactive
 /// session against a small personal PDF library.
 #[derive(Debug, Clone)]
@@ -434,7 +452,7 @@ fn build_outer_frame<'a>(
 ) -> Block<'a> {
     let brand = Span::styled(
         " pdffff ",
-        Style::default().bg(ACCENT).fg(Color::Black).add_modifier(Modifier::BOLD),
+        Style::default().bg(ACCENT).fg(pill_fg_for(ACCENT)).add_modifier(Modifier::BOLD),
     );
     let root = Span::styled(
         format!(" {} ", opts.root.display()),
@@ -535,7 +553,7 @@ fn render_input(f: &mut Frame, area: Rect, state: &AppState) {
         mode_label,
         Style::default()
             .bg(mode_bg)
-            .fg(Color::Black)
+            .fg(pill_fg_for(mode_bg))
             .add_modifier(Modifier::BOLD),
     )))
     .alignment(Alignment::Right);
@@ -566,7 +584,7 @@ fn render_error_or_hr(f: &mut Frame, area: Rect, state: &AppState) {
             " error ",
             Style::default()
                 .bg(Color::Red)
-                .fg(Color::Black)
+                .fg(pill_fg_for(Color::Red))
                 .add_modifier(Modifier::BOLD),
         );
         // Reserve room for the label, two spaces of padding, and a
@@ -629,13 +647,17 @@ fn render_hit_item(i: usize, hit: &Hit, query: &str) -> ListItem<'static> {
         "p.{} · #{} · score {:.2}",
         hit.page_no, hit.chunk_ord, hit.score,
     );
+    // Display the filename rather than the full path: the full path is
+    // typically the watched root + a long suffix, which crowds the
+    // header off the right edge and adds no information the user can't
+    // get from the corpus context.
     let header = Line::from(vec![
         Span::styled(
             format!("{:>2}. ", i + 1),
             Style::default().fg(DIM),
         ),
         Span::styled(
-            hit.path.clone(),
+            hit.filename.clone(),
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ·  ", Style::default().fg(DIM)),

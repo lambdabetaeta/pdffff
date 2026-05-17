@@ -95,13 +95,18 @@ pub enum QueryMode {
 ///
 /// Implements [`serde::Serialize`] so the CLI's `--json` mode can emit
 /// one compact JSON object per hit. The field names are stable and
-/// match the user-facing column names (`path`, `page_no`, `chunk_ord`,
-/// `score`, `snippet`).
+/// match the user-facing column names (`path`, `filename`, `page_no`,
+/// `chunk_ord`, `score`, `snippet`).
+///
+/// `filename` is the basename of `path` (carried separately so the TUI
+/// can render it without re-splitting the full path on every keystroke
+/// and so JSON consumers can show whichever they prefer).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Hit {
     pub chunk_id: i64,
     pub doc_id: i64,
     pub path: String,
+    pub filename: String,
     pub page_no: u32,
     pub chunk_ord: u32,
     pub score: f32,
@@ -263,11 +268,30 @@ fn fuzzy_search(state: &IndexState, query: &str, limit: usize) -> Result<Vec<Hit
     };
     apply_tombstones(&mut candidates, &ov);
 
-    // Gather candidate chunks — base passes through the bitset, overflow
-    // chunks are unconditionally appended (the fuzzy scorer makes the
-    // final call).
+    // Find docs whose filename *itself* matches the query, and union
+    // their chunks into the candidate set. The chunk-text bigram
+    // prefilter is computed only over `text_norm_ascii`, so a doc whose
+    // only match is in its filename (e.g. the user types part of a
+    // paper title) would otherwise never reach the fuzzy scorer.
+    //
+    // We match the filename by `memmem` against the normalized query
+    // bytes — a substring test on the ASCII-normalized form. This is
+    // looser than the bigram prefilter (so it includes any reasonable
+    // typo-free hit) and is the same normalisation the scorer's
+    // `rank_text` uses, so the downstream ranking stays consistent.
+    let filename_match_docs = docs_with_filename_match(&base, &q_norm);
+
+    // Gather candidate chunks — base passes through the bitset OR the
+    // filename-match doc set, overflow chunks are unconditionally
+    // appended (the fuzzy scorer makes the final call).
     let mut candidate_chunks: Vec<&ChunkItem> = Vec::new();
-    collect_base_candidates(&base, &ov, candidates.as_deref(), &mut candidate_chunks);
+    collect_base_candidates_with_filename_docs(
+        &base,
+        &ov,
+        candidates.as_deref(),
+        &filename_match_docs,
+        &mut candidate_chunks,
+    );
     for chunk in &ov.overflow_chunks {
         candidate_chunks.push(chunk);
     }
@@ -284,13 +308,22 @@ fn fuzzy_search(state: &IndexState, query: &str, limit: usize) -> Result<Vec<Hit
     let mut hits: Vec<Hit> = if rank_texts.len() > FRIZBEE_LIMIT {
         // Above the limit the cheap deterministic ranker is faster
         // and good enough — the report names this fallback exactly.
+        // We still let filename-match docs through even when the
+        // chunk text doesn't contain the query, so the "type part of
+        // a filename" UX survives on large corpora; the snippet
+        // anchors at offset 0 in that case.
         let needle_norm = q_norm.as_bytes();
         let finder = memmem::Finder::new(needle_norm);
         candidate_chunks
             .iter()
             .filter_map(|chunk| {
-                let pos = finder.find(&chunk.text_norm_ascii)?;
-                Some(make_hit_at_norm(chunk, pos, needle_norm.len()))
+                if let Some(pos) = finder.find(&chunk.text_norm_ascii) {
+                    Some(make_hit_at_norm(chunk, pos, needle_norm.len()))
+                } else if filename_match_docs.contains(&chunk.doc_id) {
+                    Some(make_hit_at_norm(chunk, 0, needle_norm.len()))
+                } else {
+                    None
+                }
             })
             .collect()
     } else {
@@ -431,28 +464,65 @@ fn walk_base_for_regex(
     }
 }
 
-fn collect_base_candidates<'a>(
+/// Walk the base chunks and push every chunk that either survives the
+/// bigram prefilter *or* belongs to a doc in `filename_match_docs`.
+/// Tombstoned base chunks are always hidden.
+///
+/// Used by the fuzzy path so that a query matching only a paper's
+/// filename (and not the body text) still surfaces the paper. Pass an
+/// empty `filename_match_docs` to get the strict bigram-prefilter
+/// behaviour.
+fn collect_base_candidates_with_filename_docs<'a>(
     base: &'a BaseIndex,
     ov: &Overlay,
     candidates: Option<&[u64]>,
+    filename_match_docs: &std::collections::HashSet<i64>,
     out: &mut Vec<&'a ChunkItem>,
 ) {
-    match candidates {
-        Some(bitset) => {
-            for (i, chunk) in base.chunks.iter().enumerate() {
-                if BigramIndex::is_candidate(bitset, i) {
-                    out.push(chunk);
-                }
-            }
+    for (i, chunk) in base.chunks.iter().enumerate() {
+        if ov.is_tombstoned(i) {
+            continue;
         }
-        None => {
-            for (i, chunk) in base.chunks.iter().enumerate() {
-                if !ov.is_tombstoned(i) {
-                    out.push(chunk);
-                }
-            }
+        let bigram_ok = match candidates {
+            Some(bitset) => BigramIndex::is_candidate(bitset, i),
+            None => true,
+        };
+        if bigram_ok || filename_match_docs.contains(&chunk.doc_id) {
+            out.push(chunk);
         }
     }
+}
+
+/// Doc IDs whose normalised filename contains `q_norm` as a substring.
+///
+/// `q_norm` is produced by [`normalize_query_ascii`] (deunicode + ASCII
+/// lowercase + whitespace collapse); we run the same normalisation on
+/// each filename so that, e.g., "café_2023.pdf" matches a query of
+/// "cafe". One allocation per doc, not per chunk.
+fn docs_with_filename_match(
+    base: &BaseIndex,
+    q_norm: &str,
+) -> std::collections::HashSet<i64> {
+    use std::collections::HashSet;
+    let mut out: HashSet<i64> = HashSet::new();
+    if q_norm.is_empty() {
+        return out;
+    }
+    let needle = q_norm.as_bytes();
+    let finder = memmem::Finder::new(needle);
+    // `doc_ranges` gives us one (doc_id, range) per document; the first
+    // chunk in each range carries the same `filename` Arc as every
+    // other chunk in that doc, so a single check per doc is enough.
+    for (doc_id, range) in &base.doc_ranges {
+        let Some(chunk) = base.chunks.get(range.start) else {
+            continue;
+        };
+        let fn_norm = crate::normalize::normalize_for_index(&chunk.filename);
+        if finder.find(fn_norm.as_bytes()).is_some() {
+            out.insert(*doc_id);
+        }
+    }
+    out
 }
 
 fn make_hit_at_norm(chunk: &ChunkItem, match_offset_in_norm: usize, query_len: usize) -> Hit {
@@ -460,6 +530,7 @@ fn make_hit_at_norm(chunk: &ChunkItem, match_offset_in_norm: usize, query_len: u
         chunk_id: chunk.chunk_id,
         doc_id: chunk.doc_id,
         path: chunk.path.to_string(),
+        filename: chunk.filename.to_string(),
         page_no: chunk.page_no,
         chunk_ord: chunk.chunk_ord,
         score: 1.0,
@@ -475,6 +546,7 @@ fn make_hit_at_utf8(chunk: &ChunkItem, match_offset_in_utf8: usize, query_len: u
         chunk_id: chunk.chunk_id,
         doc_id: chunk.doc_id,
         path: chunk.path.to_string(),
+        filename: chunk.filename.to_string(),
         page_no: chunk.page_no,
         chunk_ord: chunk.chunk_ord,
         score: 1.0,
@@ -608,7 +680,18 @@ fn collapse_whitespace(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_space = true;
     for ch in s.chars() {
-        if ch.is_whitespace() {
+        // Treat both whitespace and non-whitespace control characters
+        // as space. Raw PDF text occasionally contains ESC (\x1b),
+        // backspace (\x08), bell (\x07), or other sub-0x20 bytes that
+        // are *not* whitespace per `char::is_whitespace`; rendered into
+        // a TUI cell they get interpreted by the host terminal as
+        // escape sequences / cursor moves and corrupt the screen
+        // (random letters re-flowing, beeps, half-erased cells). The
+        // safe thing is to normalise every control char to a space at
+        // the snippet boundary — the same rule the bigram normaliser
+        // uses for the indexed copy.
+        let is_problem_ctrl = ch.is_control() && !ch.is_whitespace();
+        if ch.is_whitespace() || is_problem_ctrl {
             if !prev_space {
                 out.push(' ');
                 prev_space = true;
@@ -867,6 +950,7 @@ mod tests {
                 chunk_id: 1,
                 doc_id: 1,
                 path: "/a.pdf".into(),
+                filename: "a.pdf".into(),
                 page_no: 9,
                 chunk_ord: 0,
                 score: 1.0,
@@ -876,6 +960,7 @@ mod tests {
                 chunk_id: 2,
                 doc_id: 2,
                 path: "/b.pdf".into(),
+                filename: "b.pdf".into(),
                 page_no: 1,
                 chunk_ord: 0,
                 score: 1.0,
@@ -885,6 +970,7 @@ mod tests {
                 chunk_id: 3,
                 doc_id: 3,
                 path: "/c.pdf".into(),
+                filename: "c.pdf".into(),
                 page_no: 4,
                 chunk_ord: 0,
                 score: 1.0,
@@ -898,12 +984,48 @@ mod tests {
     }
 
     #[test]
+    fn snippet_strips_terminal_control_chars() {
+        // ESC, BEL and BS inside the chunk text would corrupt the
+        // host terminal if rendered raw; the snippet must collapse
+        // them to whitespace so the TUI stays stable.
+        let chunk =
+            mk_chunk(1, 1, "/a.pdf", 1, "before\x1b[31mneedle\x1b[m\x07 after \x08x");
+        let state = synthetic_state(vec![chunk]);
+        let hits = search(&state, "needle", QueryMode::Literal, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        let snip = &hits[0].snippet;
+        assert!(!snip.chars().any(|c| c.is_control() && !c.is_whitespace()),
+            "snippet must not contain raw control chars: {snip:?}");
+        // The needle and the surrounding visible text should survive,
+        // separated by spaces where control runs were.
+        assert!(snip.contains("needle"), "snippet should still contain the needle: {snip:?}");
+    }
+
+    #[test]
+    fn fuzzy_matches_against_filename() {
+        // Doc whose body text contains nothing related to "thesis",
+        // but whose filename does. Fuzzy should still surface it.
+        let state = synthetic_state(vec![
+            mk_chunk(1, 1, "/work/thesis-final.pdf", 1, "totally unrelated body text here"),
+            mk_chunk(2, 2, "/work/random.pdf", 1, "another unrelated chunk"),
+        ]);
+        let hits = search(&state, "thesis", QueryMode::Fuzzy, 10).unwrap();
+        assert!(!hits.is_empty(), "fuzzy should match against the filename");
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert!(
+            paths.contains(&"/work/thesis-final.pdf"),
+            "expected /work/thesis-final.pdf in fuzzy results, got {paths:?}",
+        );
+    }
+
+    #[test]
     fn cheap_rank_breaks_ties_by_page_then_id() {
         let mut hits = vec![
             Hit {
                 chunk_id: 10,
                 doc_id: 1,
                 path: "/a.pdf".into(),
+                filename: "a.pdf".into(),
                 page_no: 3,
                 chunk_ord: 0,
                 score: 1.0,
@@ -913,6 +1035,7 @@ mod tests {
                 chunk_id: 11,
                 doc_id: 2,
                 path: "/b.pdf".into(),
+                filename: "b.pdf".into(),
                 page_no: 1,
                 chunk_ord: 0,
                 score: 1.0,
