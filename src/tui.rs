@@ -670,56 +670,76 @@ fn highlight_snippet_spans(snippet: &str, query: &str) -> Vec<Span<'static>> {
         return vec![Span::raw(snippet.to_string())];
     }
 
-    let snippet_lc = snippet.to_lowercase();
+    // Build a lowercased copy of `snippet` and a map from byte offsets
+    // in that copy back to byte offsets in the original. Lowercasing can
+    // change byte length per codepoint ('İ' → "i\u{307}" grows, 'ẞ' →
+    // "ß" shrinks), so positions in the two strings don't coincide and
+    // we cannot index `lc_bytes` with offsets sized to `snippet`.
+    // `lc_to_orig[i] = Some(orig)` marks lc byte offset `i` as a char
+    // boundary corresponding to original byte offset `orig`; other
+    // offsets (mid-codepoint, or inside a lowercase expansion) are None.
+    let mut snippet_lc = String::with_capacity(snippet.len());
+    let mut lc_to_orig: Vec<Option<usize>> = Vec::new();
+    for (orig_byte, ch) in snippet.char_indices() {
+        while lc_to_orig.len() < snippet_lc.len() {
+            lc_to_orig.push(None);
+        }
+        lc_to_orig.push(Some(orig_byte));
+        for lc_ch in ch.to_lowercase() {
+            snippet_lc.push(lc_ch);
+        }
+    }
+    while lc_to_orig.len() < snippet_lc.len() {
+        lc_to_orig.push(None);
+    }
+    lc_to_orig.push(Some(snippet.len()));
+
     let lc_bytes = snippet_lc.as_bytes();
-    let bytes = snippet.as_bytes();
     let hl = Style::default()
         .bg(HL_BG)
         .fg(HL_FG)
         .add_modifier(Modifier::BOLD);
 
     let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut cursor = 0;
-    let mut run_start = 0;
-    while cursor < bytes.len() {
-        if !snippet.is_char_boundary(cursor) {
-            // Mid-codepoint — should not happen because we always
-            // advance by full UTF-8 char widths, but be defensive.
-            cursor += 1;
-            continue;
-        }
-        let mut matched: Option<usize> = None;
+    let mut lc_cursor = 0usize;
+    let mut orig_run_start = 0usize;
+    while lc_cursor < lc_bytes.len() {
+        let orig_cursor = match lc_to_orig.get(lc_cursor).copied().flatten() {
+            Some(p) => p,
+            None => {
+                lc_cursor += 1;
+                continue;
+            }
+        };
+        let mut matched: Option<(usize, usize)> = None; // (lc_len, orig_len)
         for n in &needles {
-            let end = cursor + n.len();
-            if end <= bytes.len()
-                && &lc_bytes[cursor..end] == n.as_bytes()
-                && snippet.is_char_boundary(end)
-                && snippet_lc.is_char_boundary(cursor)
-                && snippet_lc.is_char_boundary(end)
-            {
-                matched = Some(n.len());
+            let lc_end = lc_cursor + n.len();
+            if lc_end > lc_bytes.len() || &lc_bytes[lc_cursor..lc_end] != n.as_bytes() {
+                continue;
+            }
+            if let Some(orig_end) = lc_to_orig.get(lc_end).copied().flatten() {
+                matched = Some((n.len(), orig_end - orig_cursor));
                 break;
             }
         }
-        if let Some(len) = matched {
-            if run_start < cursor {
-                spans.push(Span::raw(snippet[run_start..cursor].to_string()));
+        if let Some((lc_len, orig_len)) = matched {
+            if orig_run_start < orig_cursor {
+                spans.push(Span::raw(snippet[orig_run_start..orig_cursor].to_string()));
             }
-            let end = cursor + len;
-            spans.push(Span::styled(snippet[cursor..end].to_string(), hl));
-            cursor = end;
-            run_start = cursor;
+            let orig_end = orig_cursor + orig_len;
+            spans.push(Span::styled(snippet[orig_cursor..orig_end].to_string(), hl));
+            lc_cursor += lc_len;
+            orig_run_start = orig_end;
         } else {
-            let ch_len = snippet[cursor..]
-                .chars()
-                .next()
-                .map(|c| c.len_utf8())
-                .unwrap_or(1);
-            cursor += ch_len;
+            let lc_step: usize = match snippet[orig_cursor..].chars().next() {
+                Some(c) => c.to_lowercase().map(|x| x.len_utf8()).sum(),
+                None => break,
+            };
+            lc_cursor += lc_step.max(1);
         }
     }
-    if run_start < snippet.len() {
-        spans.push(Span::raw(snippet[run_start..].to_string()));
+    if orig_run_start < snippet.len() {
+        spans.push(Span::raw(snippet[orig_run_start..].to_string()));
     }
     spans
 }
@@ -755,4 +775,63 @@ fn install_panic_hook() {
         let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
         original(panic_info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(spans: &[Span<'static>]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn highlight_plain_ascii() {
+        let spans = highlight_snippet_spans("Hello world", "world");
+        assert_eq!(render(&spans), "Hello world");
+        // "Hello " unhighlighted, "world" highlighted.
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content.as_ref(), "Hello ");
+        assert_eq!(spans[1].content.as_ref(), "world");
+    }
+
+    #[test]
+    fn highlight_preserves_original_case() {
+        let spans = highlight_snippet_spans("HeLLo WoRLd", "hello");
+        assert_eq!(render(&spans), "HeLLo WoRLd");
+        assert_eq!(spans[0].content.as_ref(), "HeLLo");
+    }
+
+    // Regression: lowercasing 'ẞ' (U+1E9E, 3 bytes UTF-8) yields "ß"
+    // (2 bytes), so byte positions in `snippet` and its lowercase form
+    // diverge. Previously this overflowed the lowercase slice.
+    #[test]
+    fn highlight_handles_shrinking_lowercase() {
+        let spans = highlight_snippet_spans("STRAẞE", "stra");
+        assert_eq!(render(&spans), "STRAẞE");
+    }
+
+    // Regression: lowercasing 'İ' (U+0130, 2 bytes) yields "i\u{307}"
+    // (3 bytes), the other direction of length divergence.
+    #[test]
+    fn highlight_handles_growing_lowercase() {
+        let spans = highlight_snippet_spans("İstanbul", "istanbul");
+        assert_eq!(render(&spans), "İstanbul");
+    }
+
+    #[test]
+    fn highlight_empty_query_passes_through() {
+        let spans = highlight_snippet_spans("anything", "");
+        assert_eq!(render(&spans), "anything");
+        assert_eq!(spans.len(), 1);
+    }
+
+    #[test]
+    fn highlight_longest_needle_wins() {
+        // "foo bar" (full phrase) should win over "foo" / "bar" splits.
+        let spans = highlight_snippet_spans("a foo bar b", "foo bar");
+        assert_eq!(render(&spans), "a foo bar b");
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[1].content.as_ref(), "foo bar");
+    }
 }
