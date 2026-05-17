@@ -1,9 +1,8 @@
 # pdffff
 
-Durable, fast, full-folder search across PDFs. Run a one-shot `index` over a
-directory of PDFs, then `search` for a phrase, a regex, or a fuzzy approximation
-of one — in milliseconds. Or run `watch` and let pdffff keep itself up to date
-as files come and go.
+Durable, fast, full-folder search across PDFs, served as an interactive
+TUI. Point pdffff at a folder of PDFs and it indexes, watches, and
+searches as you type — literal, regex, or fuzzy — in milliseconds.
 
 The architecture follows the design laid out in
 [`deep-research-report.md`](deep-research-report.md):
@@ -41,61 +40,29 @@ works just as well.
 ## Usage
 
 ```sh
-# Index a folder of PDFs into ./pdffff.db
-pdffff index ~/papers
-
-# Look something up
-pdffff search "monad transformer"            # literal
-pdffff search --mode regex 'fn\s+main'        # regex
-pdffff search --mode fuzzy 'topolgy'          # fuzzy / typo-tolerant
-pdffff search --json "deep learning" | jq .   # JSON output, one hit per line
-
-# Live mode — watches the folder and answers queries from stdin
-pdffff watch ~/papers
-
-# Diagnostics
-pdffff info       # row counts + bigram heap size
-pdffff diagnose   # pdftotext version, SQLite integrity_check, errored docs
+pdffff ~/papers
 ```
 
-By default the SQLite database lives in `./pdffff.db`. Override with
-`--db /path/to/file.db`.
+That opens the TUI. The initial scan and per-PDF extraction run in the
+background — results start appearing as soon as the first chunks land in
+the index, and the status bar shows progress.
 
-## Output format
+Keys:
 
-Human-readable (default):
+| Key                                 | Action                              |
+|-------------------------------------|-------------------------------------|
+| any character                       | append to the query                 |
+| `Backspace` / `Ctrl+W` / `Ctrl+U`   | erase / word-erase / clear query    |
+| `↑` `↓` / `Ctrl+P` `Ctrl+N`         | move selection                      |
+| `PageUp` / `PageDown`               | page through results                |
+| `Tab`                               | cycle mode: literal → regex → fuzzy |
+| `Enter`                             | open the selected hit in your PDF viewer |
+| `Esc` / `Ctrl+C` / `Ctrl+D` / `Ctrl+Q` | quit                             |
 
-```text
-1. /home/me/papers/perceptron.pdf (page 3, chunk #7, score 1.00)
-     a perceptron is the simplest kind of artificial neural network …
-
-2. /home/me/papers/backprop.pdf (page 1, chunk #0, score 1.00)
-     introduction to backpropagation and the perceptron learning rule …
-```
-
-With a TTY, the filename is bold, the metadata is dim, and the matched
-phrase / terms are rendered with inverse video. `NO_COLOR=1` disables
-colors.
-
-JSON (`--json`):
-
-```jsonl
-{"chunk_id":12,"doc_id":3,"path":"/home/me/papers/perceptron.pdf","page_no":3,"chunk_ord":7,"score":1.0,"snippet":"a perceptron is the simplest kind of artificial neural network …"}
-```
-
-## Subcommands
-
-| Command            | Purpose                                                            |
-|--------------------|--------------------------------------------------------------------|
-| `pdffff scan ROOT` | Dry-run scanner; shows which PDFs would be (re-)extracted.         |
-| `pdffff index ROOT`| One-shot index/refresh.                                            |
-| `pdffff watch ROOT`| Live mode: scan + extract, then watch, then interactive REPL.      |
-| `pdffff search Q`  | Search the indexed corpus.                                         |
-| `pdffff rebuild`   | Force an in-memory base-index rebuild from SQLite. Diagnostics.    |
-| `pdffff info`      | Document counts by status, active chunks, bigram heap MiB.         |
-| `pdffff diagnose`  | `pdftotext` version, SQLite integrity check, errored documents.    |
-
-`pdffff <cmd> --help` for the full flag list of each subcommand.
+The SQLite database is stored per-corpus under your platform's data
+directory (`$XDG_DATA_HOME/pdffff/<basename>-<hash>.db` on Linux).
+Override with `--db /path/to/file.db`. Tracing output goes to a log
+file — `$TMPDIR/pdffff.log` by default, or pass `--log-file`.
 
 ## How it works (one paragraph)
 
@@ -117,8 +84,7 @@ overlay crosses thresholds.
 
 ## Status
 
-All seven days of the deep-research roadmap are implemented and the
-five measurable success criteria are exercised in `tests/success_criteria.rs`:
+The five measurable success criteria from the design report all hold:
 
 1. Indexes many PDFs into SQLite without manual intervention.
 2. Second startup re-uses SQLite (zero re-extraction).
@@ -127,8 +93,7 @@ five measurable success criteria are exercised in `tests/success_criteria.rs`:
 5. Every result carries a path, a 1-based page number, and a
    match-centred snippet.
 
-`cargo test` runs 97 tests (70 unit + 27 integration); `cargo build
---release` is clean.
+`cargo test` is green; `cargo build --release` is clean.
 
 ## Attribution
 

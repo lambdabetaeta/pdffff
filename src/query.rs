@@ -57,7 +57,7 @@ use crate::bigram_query::{fuzzy_to_bigram_query, regex_to_bigram_query};
 use crate::index::{BaseIndex, ChunkItem, IndexState, Overlay};
 use crate::normalize::normalize_query_ascii;
 
-/// CLI / TUI cap on the number of hits surfaced to the user.
+/// Cap on the number of hits surfaced to the user in the TUI.
 pub const DISPLAY_LIMIT: usize = 200;
 
 /// Number of evenly-spaced probe bigrams to take when decomposing a
@@ -91,17 +91,11 @@ pub enum QueryMode {
     Fuzzy,
 }
 
-/// One search result, ready to format for the CLI.
-///
-/// Implements [`serde::Serialize`] so the CLI's `--json` mode can emit
-/// one compact JSON object per hit. The field names are stable and
-/// match the user-facing column names (`path`, `filename`, `page_no`,
-/// `chunk_ord`, `score`, `snippet`).
+/// One search result, rendered by the TUI.
 ///
 /// `filename` is the basename of `path` (carried separately so the TUI
-/// can render it without re-splitting the full path on every keystroke
-/// and so JSON consumers can show whichever they prefer).
-#[derive(Debug, Clone, serde::Serialize)]
+/// can render it without re-splitting the full path on every keystroke).
+#[derive(Debug, Clone)]
 pub struct Hit {
     pub chunk_id: i64,
     pub doc_id: i64,
@@ -493,32 +487,41 @@ fn collect_base_candidates_with_filename_docs<'a>(
     }
 }
 
-/// Doc IDs whose normalised filename contains `q_norm` as a substring.
+/// Doc IDs whose normalised filename contains every whitespace-delimited
+/// term of `q_norm` as a substring.
 ///
 /// `q_norm` is produced by [`normalize_query_ascii`] (deunicode + ASCII
 /// lowercase + whitespace collapse); we run the same normalisation on
 /// each filename so that, e.g., "café_2023.pdf" matches a query of
 /// "cafe". One allocation per doc, not per chunk.
+///
+/// The per-term AND (rather than a single contiguous-substring check) is
+/// what lets a multi-word query like `streicher 1994` match a filename
+/// like `Streicher - 1994 - A universality.pdf` — the separators between
+/// the terms in the filename would defeat a single `memmem` of the joined
+/// query. Filenames in academic corpora routinely separate the author,
+/// year, and title with hyphens or underscores, so the substring-only
+/// rule was too strict in practice.
 fn docs_with_filename_match(
     base: &BaseIndex,
     q_norm: &str,
 ) -> std::collections::HashSet<i64> {
     use std::collections::HashSet;
     let mut out: HashSet<i64> = HashSet::new();
-    if q_norm.is_empty() {
+    let terms: Vec<&str> = q_norm.split_whitespace().collect();
+    if terms.is_empty() {
         return out;
     }
-    let needle = q_norm.as_bytes();
-    let finder = memmem::Finder::new(needle);
-    // `doc_ranges` gives us one (doc_id, range) per document; the first
-    // chunk in each range carries the same `filename` Arc as every
-    // other chunk in that doc, so a single check per doc is enough.
-    for (doc_id, range) in &base.doc_ranges {
-        let Some(chunk) = base.chunks.get(range.start) else {
-            continue;
-        };
-        let fn_norm = crate::normalize::normalize_for_index(&chunk.filename);
-        if finder.find(fn_norm.as_bytes()).is_some() {
+    let finders: Vec<memmem::Finder> = terms
+        .iter()
+        .map(|t| memmem::Finder::new(t.as_bytes()))
+        .collect();
+    // Read pre-normalised filenames from the BaseIndex cache. They were
+    // computed once at index-build time so per-keystroke fuzzy search
+    // doesn't re-run `deunicode` over every filename in the corpus.
+    for (doc_id, fn_norm) in &base.filename_norms {
+        let fn_bytes = fn_norm.as_bytes();
+        if finders.iter().all(|f| f.find(fn_bytes).is_some()) {
             out.insert(*doc_id);
         }
     }
@@ -735,10 +738,20 @@ mod tests {
                 &chunks,
             )))
         };
+        let mut filename_norms: HashMap<i64, String> = HashMap::new();
+        for (doc_id, range) in &doc_ranges {
+            if let Some(chunk) = chunks.get(range.start) {
+                filename_norms.insert(
+                    *doc_id,
+                    crate::normalize::normalize_for_index(&chunk.filename),
+                );
+            }
+        }
         let base = BaseIndex {
             chunks: Arc::new(chunks),
             doc_ranges,
             bigrams,
+            filename_norms,
             built_at_ms: 0,
         };
         IndexState::new(base)
@@ -1015,6 +1028,54 @@ mod tests {
         assert!(
             paths.contains(&"/work/thesis-final.pdf"),
             "expected /work/thesis-final.pdf in fuzzy results, got {paths:?}",
+        );
+    }
+
+    #[test]
+    fn fuzzy_matches_author_and_title_tokens_in_filename() {
+        // Same shape as the Streicher-1994 case, but with the two
+        // query terms being the author and a word from the title —
+        // covers the variant the user reported alongside the year one.
+        let state = synthetic_state(vec![
+            mk_chunk(
+                1,
+                1,
+                "/papers/Streicher - 1994 - A universality.pdf",
+                1,
+                "totally unrelated body text here",
+            ),
+            mk_chunk(2, 2, "/papers/random.pdf", 1, "another unrelated chunk"),
+        ]);
+        let hits = search(&state, "streicher universality", QueryMode::Fuzzy, 10).unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert!(
+            paths.contains(&"/papers/Streicher - 1994 - A universality.pdf"),
+            "expected the Streicher universality paper in fuzzy results, got {paths:?}",
+        );
+    }
+
+    #[test]
+    fn fuzzy_matches_multiword_query_across_filename_separators() {
+        // Real-world academic-paper case: the filename embeds the
+        // author and year separated by " - ", and the user types just
+        // those two tokens with a space. A single contiguous-substring
+        // check against the normalised filename would miss this; the
+        // per-term match must succeed.
+        let state = synthetic_state(vec![
+            mk_chunk(
+                1,
+                1,
+                "/papers/Streicher - 1994 - A universality.pdf",
+                1,
+                "totally unrelated body text here",
+            ),
+            mk_chunk(2, 2, "/papers/random.pdf", 1, "another unrelated chunk"),
+        ]);
+        let hits = search(&state, "streicher 1994", QueryMode::Fuzzy, 10).unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert!(
+            paths.contains(&"/papers/Streicher - 1994 - A universality.pdf"),
+            "expected the Streicher 1994 paper in fuzzy results, got {paths:?}",
         );
     }
 

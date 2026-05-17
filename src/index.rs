@@ -88,6 +88,12 @@ pub struct BaseIndex {
     pub chunks: Arc<Vec<ChunkItem>>,
     pub doc_ranges: HashMap<i64, Range<usize>>,
     pub bigrams: Option<Arc<BigramIndex>>,
+    /// Per-doc normalised filename, computed once at index build so the
+    /// fuzzy query path's filename-match pass can avoid re-running
+    /// `normalize_for_index` (which allocates via `deunicode`) on every
+    /// filename of every doc on every keystroke. Keyed by `doc_id` to
+    /// match `doc_ranges`.
+    pub filename_norms: HashMap<i64, String>,
     pub built_at_ms: i64,
 }
 
@@ -97,6 +103,7 @@ impl BaseIndex {
             chunks: Arc::new(Vec::new()),
             doc_ranges: HashMap::new(),
             bigrams: None,
+            filename_norms: HashMap::new(),
             built_at_ms: now_ms(),
         }
     }
@@ -412,9 +419,7 @@ impl IndexState {
 /// verification passes, and the swap of `base` is itself atomic via
 /// `arc-swap`.
 ///
-/// This is the routine called by [`IndexState::rebuild_if_needed`]; it
-/// is also exposed publicly so the CLI's `rebuild` subcommand can force
-/// a rebuild on demand.
+/// This is the routine called by [`IndexState::rebuild_if_needed`].
 pub fn rebuild_from_db(state: &IndexState, db: &Db) -> Result<()> {
     let new_base = load_base_index_from_db(db)?;
     let new_chunk_count = new_base.chunks.len();
@@ -502,10 +507,18 @@ pub fn load_base_index_from_db(db: &Db) -> Result<BaseIndex> {
         Some(Arc::new(build_bigram_index_from_chunks(&chunks)))
     };
 
+    let filename_norms: HashMap<i64, String> = path_cache
+        .iter()
+        .map(|(doc_id, (_, filename))| {
+            (*doc_id, crate::normalize::normalize_for_index(filename))
+        })
+        .collect();
+
     Ok(BaseIndex {
         chunks: Arc::new(chunks),
         doc_ranges,
         bigrams,
+        filename_norms,
         built_at_ms: now_ms(),
     })
 }
@@ -590,6 +603,7 @@ mod tests {
             chunks: Arc::new(chunks),
             doc_ranges,
             bigrams: None,
+            filename_norms: HashMap::new(),
             built_at_ms: 0,
         }
     }

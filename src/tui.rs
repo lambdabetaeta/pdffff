@@ -46,9 +46,10 @@
 //!
 //! Tracing
 //! -------
-//! The TUI does not write tracing output itself. The CLI redirects
-//! the `tracing` subscriber to a log file before entering the TUI so
-//! that index-progress logs do not corrupt the alternate screen.
+//! The TUI does not write tracing output itself. The launcher
+//! (`main.rs`) redirects the `tracing` subscriber to a log file before
+//! entering the TUI so that index-progress logs do not corrupt the
+//! alternate screen.
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -151,7 +152,7 @@ impl Default for TuiOptions {
     fn default() -> Self {
         Self {
             limit: DISPLAY_LIMIT,
-            initial_mode: QueryMode::Literal,
+            initial_mode: QueryMode::Fuzzy,
             root: PathBuf::new(),
         }
     }

@@ -1,8 +1,6 @@
 //! pdffff binary: a pure-TUI launcher.
 //!
-//! The previous build shipped a clap subcommand surface (`scan`,
-//! `index`, `watch`, `search`, `rebuild`, `info`, `diagnose`, `tui`).
-//! The current build collapses all of that into a single entry point:
+//! The entry point is a single command:
 //!
 //! ```text
 //! pdffff <ROOT> [flags]
@@ -62,7 +60,7 @@ struct Cli {
     debounce_ms: Option<u64>,
 
     /// Initial query mode. Tab cycles literal → regex → fuzzy in the TUI.
-    #[arg(long, value_enum, default_value_t = CliQueryMode::Literal)]
+    #[arg(long, value_enum, default_value_t = CliQueryMode::Fuzzy)]
     mode: CliQueryMode,
 
     /// Cap on hits surfaced per query.

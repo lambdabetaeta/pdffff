@@ -115,6 +115,7 @@ fn build_state(n: usize) -> IndexState {
         chunks: Arc::new(chunks),
         doc_ranges,
         bigrams,
+        filename_norms: std::collections::HashMap::new(),
         built_at_ms: 0,
     };
     IndexState::new(base)

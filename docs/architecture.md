@@ -60,20 +60,13 @@ is really a match.
 | `src/bigram_query.rs`   | `regex_to_bigram_query`, `fuzzy_to_bigram_query` (adapted from `fff`).|
 | `src/index.rs`          | `ChunkItem`, `BaseIndex`, `Overlay`, `IndexState`, rebuild routine.   |
 | `src/query.rs`          | `search(state, query, mode, limit)`, snippet rendering.              |
-| `src/app.rs`            | `run_index`, `run_search`, `run_watch`, `run_rebuild`.               |
-| `src/main.rs`           | clap CLI; thin wrapper.                                              |
+| `src/app.rs`            | `run_watch` coordinator + writer threads, `WatchHandle`.             |
+| `src/tui.rs`            | Ratatui interactive search loop.                                     |
+| `src/main.rs`           | TUI launcher; clap-parsed arguments + `run_watch` + `run_tui`.       |
 
 ## Threading model
 
-`run_index` (one-shot):
-
-```
-Scanner (this thread, sync)
-   └── ScanResult ──► rayon extractor pool (N = min(num_cpus, 6))
-                          └── flume::bounded(64) ──► DB writer thread
-```
-
-`run_watch` (long-lived):
+`run_watch` (long-lived; the only entry point now):
 
 ```
 Scanner (startup pass)
@@ -155,11 +148,9 @@ snapshot.
 
 ## Tests
 
-* `cargo test` covers 97 cases (70 unit + 4 + 10 + 5 + 5 + 3 integration).
-* `tests/success_criteria.rs` exercises each of the report's measurable
-  promises.
-* `tests/failure_modes.rs` exercises corrupted PDFs, image-only PDFs,
-  missing `pdftotext`, and unwritable SQLite paths.
+* `cargo test` covers the unit tests plus `tests/watch_pipeline.rs`,
+  which exercises scan → extract → overlay → search end-to-end across
+  initial scan, new arrivals, modifications, and deletions.
 * `benches/literal_search.rs` and `benches/bigram_build.rs` provide
   criterion benchmarks scaled to illustrate the path to the report's
   100k-chunk target.

@@ -372,7 +372,9 @@ pub fn extractor_version_or_missing() -> String {
 }
 
 /// Sanity check: returns `Err` if `pdftotext` is on PATH but appears
-/// unusable. Used at startup of the `index` subcommand.
+/// unusable. Called at launcher startup before the indexer threads
+/// kick in, so the user gets a clean error rather than a stream of
+/// per-doc extractor failures.
 pub fn probe_pdftotext_or_explain() -> Result<()> {
     let out = Command::new("pdftotext")
         .arg("-v")
