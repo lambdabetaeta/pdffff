@@ -8,9 +8,9 @@
 //!  │                                                                       │
 //!  │  ❯ query▏                                                  LITERAL    │
 //!  │  ───────────────────────────────────────────────────────────────────  │
-//!  │   ▌ 1. paper.pdf                              p.12 · #3 · score 1.00  │
+//!  │   ▌ 1. paper.pdf                                            p.12 · #3 │
 //!  │       …matching snippet excerpt with highlighted terms…               │
-//!  │     2. other.pdf                              p. 1 · #0 · score 0.95  │
+//!  │     2. other.pdf                              p. 1 · #0 · score 1247  │
 //!  │       …another snippet…                                               │
 //!  │                                                                       │
 //!  ╰─ ↑↓ select · Tab mode · Enter pick · Ctrl+U clear · Esc quit ─────────╯
@@ -629,7 +629,7 @@ fn render_results(f: &mut Frame, area: Rect, state: &AppState) {
         .hits
         .iter()
         .enumerate()
-        .map(|(i, hit)| render_hit_item(i, hit, &state.query))
+        .map(|(i, hit)| render_hit_item(i, hit, &state.query, state.mode))
         .collect();
 
     let list = List::new(items)
@@ -643,11 +643,19 @@ fn render_results(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_stateful_widget(list, area, &mut list_state);
 }
 
-fn render_hit_item(i: usize, hit: &Hit, query: &str) -> ListItem<'static> {
-    let meta = format!(
-        "p.{} · #{} · score {:.2}",
-        hit.page_no, hit.chunk_ord, hit.score,
-    );
+fn render_hit_item(i: usize, hit: &Hit, query: &str, mode: QueryMode) -> ListItem<'static> {
+    // Score is only meaningful in fuzzy mode (it's the neo_frizbee u16
+    // turned into f32). For literal and regex matches it is a hardcoded
+    // `1.0` — showing it there is noise, so we hide the field.
+    let meta = match mode {
+        QueryMode::Fuzzy => format!(
+            "p.{} · #{} · score {:.2}",
+            hit.page_no, hit.chunk_ord, hit.score,
+        ),
+        QueryMode::Literal | QueryMode::Regex => {
+            format!("p.{} · #{}", hit.page_no, hit.chunk_ord)
+        }
+    };
     // Display the filename rather than the full path: the full path is
     // typically the watched root + a long suffix, which crowds the
     // header off the right edge and adds no information the user can't
