@@ -4,17 +4,16 @@
 //! query-against-a-live-index workflow):
 //!
 //! ```text
-//!  pdffff  /Users/foo/papers  •  123 ok / 0 err  •  ⠿ indexing 3
-//!  ──────────────────────────────────────────────────────────────
-//!  > query|                                              [literal]
-//!  ──────────────────────────────────────────────────────────────
-//!  ▶ 1. paper.pdf (page 12, chunk #3, score 1.00)
-//!        …matching snippet excerpt…
-//!    2. other.pdf (page  1, chunk #0, score 0.95)
-//!        …another matching snippet…
-//!    …
-//!  ──────────────────────────────────────────────────────────────
-//!  ↑/↓ select   Tab mode   Enter print   Ctrl+C quit
+//!  ╭─ pdffff /Users/foo/papers ──────────  123 ok · 0 err · ⠿ indexing 3 ─╮
+//!  │                                                                       │
+//!  │  ❯ query▏                                                  LITERAL    │
+//!  │  ───────────────────────────────────────────────────────────────────  │
+//!  │   ▌ 1. paper.pdf                              p.12 · #3 · score 1.00  │
+//!  │       …matching snippet excerpt with highlighted terms…               │
+//!  │     2. other.pdf                              p. 1 · #0 · score 0.95  │
+//!  │       …another snippet…                                               │
+//!  │                                                                       │
+//!  ╰─ ↑↓ select · Tab mode · Enter pick · Ctrl+U clear · Esc quit ─────────╯
 //! ```
 //!
 //! The TUI owns a [`WatchHandle`] from [`crate::app::run_watch`]: the
@@ -65,10 +64,13 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{
+        Block, BorderType, Borders, HighlightSpacing, List, ListItem, ListState, Padding,
+        Paragraph,
+    },
 };
 use std::io::{self, Stdout};
 use std::path::PathBuf;
@@ -85,7 +87,32 @@ use crate::query::{DISPLAY_LIMIT, Hit, QueryMode, search};
 const TICK: Duration = Duration::from_millis(100);
 
 /// Spinner frames cycled at every [`TICK`].
-const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+const SPINNER_FRAMES: [&str; 10] =
+    ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+// ─────────────────────────── palette ───────────────────────────
+//
+// We stick to *named* / 256-indexed terminal colours so the UI
+// respects whatever colour theme the user has configured for their
+// terminal (light, dark, Solarized, …) rather than baking in RGB
+// values that fight a user's theme.
+
+/// Brand accent. Used for the pdffff pill, prompt, key chips, and
+/// the LITERAL mode pill.
+const ACCENT: Color = Color::Cyan;
+/// Subtle dim — borders, meta text, middot separators.
+const DIM: Color = Color::DarkGray;
+/// Border colour for the outer frame and the inline separator.
+const BORDER: Color = Color::DarkGray;
+/// Selection background for the currently-highlighted hit. Indexed
+/// 237 is a near-black grey on a 256-colour terminal which contrasts
+/// gently with most themes; it falls back to terminal default on
+/// 16-colour TTYs.
+const SEL_BG: Color = Color::Indexed(237);
+/// Foreground used for matched query substrings inside snippets.
+const HL_FG: Color = Color::Black;
+/// Background used for matched query substrings inside snippets.
+const HL_BG: Color = Color::Yellow;
 
 /// Knobs for [`run_tui`]. The defaults are sensible for an interactive
 /// session against a small personal PDF library.
@@ -369,116 +396,195 @@ fn render(
     progress: &IndexProgress,
 ) {
     let size = f.area();
+    let snap = snapshot_progress(progress);
+
+    let outer = build_outer_frame(&snap, opts, state);
+    let inner = outer.inner(size);
+    f.render_widget(outer, size);
+
+    // Vertical layout *inside* the outer frame.
+    //   row 0  : breathing room
+    //   row 1  : input + mode pill
+    //   row 2  : separator (or inline error)
+    //   rest   : results list
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // status bar
-            Constraint::Length(1), // separator
-            Constraint::Length(1), // input
-            Constraint::Length(1), // separator / error
-            Constraint::Min(3),    // results
-            Constraint::Length(1), // help
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
         ])
-        .split(size);
+        .split(inner);
 
-    render_status_bar(f, layout[0], opts, progress, state);
-    render_hr(f, layout[1]);
-    render_input(f, layout[2], state);
-    render_error_or_hr(f, layout[3], state);
-    render_results(f, layout[4], state);
-    render_help(f, layout[5]);
+    render_input(f, layout[1], state);
+    render_error_or_hr(f, layout[2], state);
+    render_results(f, layout[3], state);
 }
 
-fn render_status_bar(
-    f: &mut Frame,
-    area: Rect,
-    opts: &TuiOptions,
-    progress: &IndexProgress,
+/// The outer rounded frame. Title-top-left carries the brand pill and
+/// the watched root; title-top-right carries the live counters and
+/// indexing spinner; title-bottom carries the keybinding hints.
+fn build_outer_frame<'a>(
+    snap: &ProgressSnapshot,
+    opts: &'a TuiOptions,
     state: &AppState,
-) {
-    let snap = snapshot_progress(progress);
-    let spinner_idx =
-        (state.spinner_started.elapsed().as_millis() / TICK.as_millis()) as usize % SPINNER_FRAMES.len();
-    let indexing = if snap.pending > 0 {
-        format!(" {} indexing ({})", SPINNER_FRAMES[spinner_idx], snap.pending)
-    } else {
-        " idle".to_string()
-    };
-    let root = opts.root.display().to_string();
-    let counters = format!(
-        "{} ok / {} empty / {} err / {} del",
-        snap.ok, snap.empty, snap.error, snap.deleted,
+) -> Block<'a> {
+    let brand = Span::styled(
+        " pdffff ",
+        Style::default().bg(ACCENT).fg(Color::Black).add_modifier(Modifier::BOLD),
     );
-    let line = Line::from(vec![
-        Span::styled(
-            " pdffff ",
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+    let root = Span::styled(
+        format!(" {} ", opts.root.display()),
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    );
+    let top_left = Line::from(vec![Span::raw(" "), brand, root]).left_aligned();
+
+    let counters = Span::styled(
+        format!(
+            "{} ok · {} empty · {} err · {} del",
+            snap.ok, snap.empty, snap.error, snap.deleted,
         ),
+        Style::default().fg(DIM),
+    );
+    let spinner_idx = (state.spinner_started.elapsed().as_millis()
+        / TICK.as_millis()) as usize
+        % SPINNER_FRAMES.len();
+    let activity = if snap.pending > 0 {
+        Span::styled(
+            format!(" {} indexing {} ", SPINNER_FRAMES[spinner_idx], snap.pending),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(" idle ", Style::default().fg(DIM))
+    };
+    let top_right = Line::from(vec![
+        counters,
+        Span::styled(" · ", Style::default().fg(DIM)),
+        activity,
         Span::raw(" "),
-        Span::styled(root, Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("  •  "),
-        Span::raw(counters),
-        Span::raw("  •"),
-        Span::styled(
-            indexing,
-            if snap.pending > 0 {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            },
-        ),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+    ])
+    .right_aligned();
+
+    let help = Line::from(vec![
+        Span::raw(" "),
+        key_chip("↑↓"),
+        Span::raw(" select  "),
+        key_chip("Tab"),
+        Span::raw(" mode  "),
+        key_chip("Enter"),
+        Span::raw(" pick  "),
+        key_chip("Ctrl+U"),
+        Span::raw(" clear  "),
+        key_chip("Esc"),
+        Span::raw(" quit "),
+    ])
+    .left_aligned()
+    .style(Style::default().fg(DIM));
+
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .padding(Padding::new(1, 1, 0, 0))
+        .title_top(top_left)
+        .title_top(top_right)
+        .title_bottom(help)
 }
 
-fn render_hr(f: &mut Frame, area: Rect) {
-    let bar = "─".repeat(area.width as usize);
-    f.render_widget(
-        Paragraph::new(bar).style(Style::default().fg(Color::DarkGray)),
-        area,
-    );
+/// A keybinding label, styled bright against the dim help footer.
+fn key_chip(text: &str) -> Span<'_> {
+    Span::styled(
+        text,
+        Style::default()
+            .fg(ACCENT)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 fn render_input(f: &mut Frame, area: Rect, state: &AppState) {
-    // Reserve the rightmost ~12 cols for the [mode] tag.
-    let mode_label = match state.mode {
-        QueryMode::Literal => "[literal]",
-        QueryMode::Regex => "[regex]  ",
-        QueryMode::Fuzzy => "[fuzzy]  ",
+    let (mode_label, mode_bg) = match state.mode {
+        QueryMode::Literal => (" LITERAL ", Color::Cyan),
+        QueryMode::Regex => (" REGEX ", Color::Yellow),
+        QueryMode::Fuzzy => (" FUZZY ", Color::Magenta),
     };
-    let mode_width = mode_label.len() as u16 + 2; // padding on both sides
+    let mode_w = mode_label.chars().count() as u16;
+
+    // Left: prompt + query.  Right: mode pill.
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(8), Constraint::Length(mode_width)])
+        .constraints([
+            Constraint::Min(8),
+            Constraint::Length(mode_w),
+        ])
         .split(area);
 
-    let input = Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(state.query.clone()),
-        Span::styled("▏", Style::default().fg(Color::Cyan)), // cursor glyph
-    ]);
-    f.render_widget(Paragraph::new(input), cols[0]);
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            mode_label,
-            Style::default().fg(Color::Magenta),
-        ))),
-        cols[1],
+    let prompt = Span::styled(
+        "❯ ",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     );
+    let query = Span::styled(
+        state.query.clone(),
+        Style::default().add_modifier(Modifier::BOLD),
+    );
+    f.render_widget(Paragraph::new(Line::from(vec![prompt, query])), cols[0]);
+
+    let pill = Paragraph::new(Line::from(Span::styled(
+        mode_label,
+        Style::default()
+            .bg(mode_bg)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+    )))
+    .alignment(Alignment::Right);
+    f.render_widget(pill, cols[1]);
+
+    // Real terminal cursor at the end of the query, clamped to the
+    // visible width of the input column. Visual width of `❯ ` is 2.
+    const PROMPT_W: u16 = 2;
+    let query_chars = state.query.chars().count() as u16;
+    let cursor_x = cols[0]
+        .x
+        .saturating_add(PROMPT_W)
+        .saturating_add(query_chars);
+    let max_x = cols[0]
+        .x
+        .saturating_add(cols[0].width.saturating_sub(1));
+    f.set_cursor_position(Position::new(cursor_x.min(max_x), cols[0].y));
 }
 
+/// When there is a query error, render it under the input as a red
+/// pill plus message; otherwise draw a dim separator across the
+/// content area (a horizontal rule that visually splits input from
+/// results, but inside the rounded frame so it never touches the
+/// border).
 fn render_error_or_hr(f: &mut Frame, area: Rect, state: &AppState) {
     if let Some(err) = &state.last_error {
-        let truncated: String = err.chars().take(area.width as usize).collect();
+        let label = Span::styled(
+            " error ",
+            Style::default()
+                .bg(Color::Red)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        );
+        // Reserve room for the label, two spaces of padding, and a
+        // little safety margin so we never wrap to a second line.
+        let budget = area.width.saturating_sub(10) as usize;
+        let truncated: String = err.chars().take(budget).collect();
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                truncated,
-                Style::default().fg(Color::Red),
-            ))),
+            Paragraph::new(Line::from(vec![
+                label,
+                Span::raw(" "),
+                Span::styled(truncated, Style::default().fg(Color::Red)),
+            ])),
             area,
         );
-    } else {
-        render_hr(f, area);
+    } else if area.width > 0 {
+        let bar = "─".repeat(area.width as usize);
+        f.render_widget(
+            Paragraph::new(bar).style(Style::default().fg(BORDER)),
+            area,
+        );
     }
 }
 
@@ -487,15 +593,14 @@ fn render_results(f: &mut Frame, area: Rect, state: &AppState) {
         let msg = if state.query.trim().is_empty() {
             "type a query to search the index"
         } else {
-            "(no hits)"
+            "no hits"
         };
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                msg,
-                Style::default().fg(Color::DarkGray),
-            ))),
-            area,
-        );
+        let placeholder = Paragraph::new(Line::from(Span::styled(
+            msg,
+            Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+        )))
+        .alignment(Alignment::Center);
+        f.render_widget(placeholder, area);
         return;
     }
 
@@ -507,68 +612,116 @@ fn render_results(f: &mut Frame, area: Rect, state: &AppState) {
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::NONE))
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
-        .highlight_symbol("▶ ");
+        .highlight_style(
+            Style::default().bg(SEL_BG).add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▌ ")
+        .highlight_spacing(HighlightSpacing::Always);
 
     let mut list_state = state.list_state.clone();
     f.render_stateful_widget(list, area, &mut list_state);
 }
 
-fn render_hit_item<'a>(i: usize, hit: &'a Hit, query: &str) -> ListItem<'a> {
+fn render_hit_item(i: usize, hit: &Hit, query: &str) -> ListItem<'static> {
+    let meta = format!(
+        "p.{} · #{} · score {:.2}",
+        hit.page_no, hit.chunk_ord, hit.score,
+    );
     let header = Line::from(vec![
-        Span::raw(format!("{:>3}. ", i + 1)),
+        Span::styled(
+            format!("{:>2}. ", i + 1),
+            Style::default().fg(DIM),
+        ),
         Span::styled(
             hit.path.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            format!(
-                " (page {}, chunk #{}, score {:.2})",
-                hit.page_no, hit.chunk_ord, hit.score,
-            ),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled("  ·  ", Style::default().fg(DIM)),
+        Span::styled(meta, Style::default().fg(DIM)),
     ]);
-    let snippet = highlight_snippet(&hit.snippet, query);
-    ListItem::new(vec![header, Line::from(vec![Span::raw("     "), snippet])])
+
+    let mut snippet_spans: Vec<Span<'static>> = vec![Span::raw("   ")];
+    snippet_spans.extend(highlight_snippet_spans(&hit.snippet, query));
+    ListItem::new(vec![header, Line::from(snippet_spans)])
 }
 
-/// Render `snippet` as a `Line` with case-insensitive substring matches
-/// for `query` (or its whitespace-split terms) painted in inverse video.
-/// Mirrors the CLI's `highlight_snippet` but emits `Span`s instead of
-/// embedded ANSI escapes so ratatui can compose the styles itself.
-fn highlight_snippet<'a>(snippet: &'a str, query: &str) -> Span<'a> {
-    // Cheap path: no query / empty query → no highlighting.
+/// Render `snippet` as a list of styled spans, painting case-insensitive
+/// substring matches for `query` (or its whitespace-split terms) on a
+/// yellow background. Greedy left-to-right, longest-needle-wins — so a
+/// match on the full phrase takes precedence over its constituent
+/// terms. UTF-8 safe.
+fn highlight_snippet_spans(snippet: &str, query: &str) -> Vec<Span<'static>> {
     let phrase = query.trim().to_lowercase();
-    if phrase.is_empty() {
-        return Span::raw(snippet.to_string());
+    let mut needles: Vec<String> = if phrase.is_empty() {
+        Vec::new()
+    } else {
+        let mut v = vec![phrase.clone()];
+        v.extend(
+            phrase
+                .split_whitespace()
+                .filter(|t| *t != phrase)
+                .map(|t| t.to_lowercase()),
+        );
+        v
+    };
+    needles.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    needles.dedup();
+    if needles.is_empty() {
+        return vec![Span::raw(snippet.to_string())];
     }
-    // The ratatui `List` widget cannot easily nest multiple spans on
-    // one logical line when used with multi-line `ListItem`s, so we
-    // emit a single Span for simplicity. The highlight is therefore
-    // limited to a uniform style; if we ever want per-term colors we
-    // can switch to `Line::from(Vec<Span>)` here.
-    Span::raw(snippet.to_string())
-}
 
-fn render_help(f: &mut Frame, area: Rect) {
-    let help = Line::from(vec![
-        Span::styled(" ↑↓ ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("select  "),
-        Span::styled("Tab ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("mode  "),
-        Span::styled("Enter ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("pick  "),
-        Span::styled("Ctrl+U ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("clear  "),
-        Span::styled("Ctrl+C / Esc ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("quit"),
-    ]);
-    f.render_widget(
-        Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
-        area,
-    );
+    let snippet_lc = snippet.to_lowercase();
+    let lc_bytes = snippet_lc.as_bytes();
+    let bytes = snippet.as_bytes();
+    let hl = Style::default()
+        .bg(HL_BG)
+        .fg(HL_FG)
+        .add_modifier(Modifier::BOLD);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cursor = 0;
+    let mut run_start = 0;
+    while cursor < bytes.len() {
+        if !snippet.is_char_boundary(cursor) {
+            // Mid-codepoint — should not happen because we always
+            // advance by full UTF-8 char widths, but be defensive.
+            cursor += 1;
+            continue;
+        }
+        let mut matched: Option<usize> = None;
+        for n in &needles {
+            let end = cursor + n.len();
+            if end <= bytes.len()
+                && &lc_bytes[cursor..end] == n.as_bytes()
+                && snippet.is_char_boundary(end)
+                && snippet_lc.is_char_boundary(cursor)
+                && snippet_lc.is_char_boundary(end)
+            {
+                matched = Some(n.len());
+                break;
+            }
+        }
+        if let Some(len) = matched {
+            if run_start < cursor {
+                spans.push(Span::raw(snippet[run_start..cursor].to_string()));
+            }
+            let end = cursor + len;
+            spans.push(Span::styled(snippet[cursor..end].to_string(), hl));
+            cursor = end;
+            run_start = cursor;
+        } else {
+            let ch_len = snippet[cursor..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
+            cursor += ch_len;
+        }
+    }
+    if run_start < snippet.len() {
+        spans.push(Span::raw(snippet[run_start..].to_string()));
+    }
+    spans
 }
 
 // ──────────────────────────── terminal setup ───────────────────────
@@ -603,4 +756,3 @@ fn install_panic_hook() {
         original(panic_info);
     }));
 }
-
