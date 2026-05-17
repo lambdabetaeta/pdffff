@@ -37,4 +37,5 @@ pub mod index;
 pub mod normalize;
 pub mod query;
 pub mod scanner;
+pub mod tui;
 pub mod watcher;

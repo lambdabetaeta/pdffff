@@ -116,7 +116,7 @@ pub fn run_index(db_path: &Path, root: &Path, opts: &IndexOptions) -> Result<Ind
     // ---- DB writer thread ----------------------------------------------
     let (tx, rx) = flume::bounded::<WriterMsg>(64);
     let writer_db_path = db_path.to_path_buf();
-    let counters = Arc::new(WriterCounters::default());
+    let counters = Arc::new(IndexProgress::default());
     let writer_counters = counters.clone();
     let writer_handle = thread::Builder::new()
         .name("pdffff-db-writer".into())
@@ -248,8 +248,8 @@ impl Default for WatchOptions {
 }
 
 /// Live handle exposed by [`run_watch`] when the caller asks for
-/// programmatic control (tests). Owns every thread the watch loop
-/// spawned and signals them to shut down on [`WatchHandle::stop`].
+/// programmatic control (tests, the TUI). Owns every thread the watch
+/// loop spawned and signals them to shut down on [`WatchHandle::stop`].
 pub struct WatchHandle {
     /// Shared with the coordinator: when set, the writer / coordinator
     /// drain their queues and exit at the next opportunity.
@@ -263,9 +263,13 @@ pub struct WatchHandle {
     /// Kept alive for the lifetime of the watcher; dropped in `stop`
     /// to halt notify's internal thread.
     _watcher: Option<WatcherHandle>,
-    /// Live in-memory index. Exposed so tests (and a future TUI) can
-    /// run queries while the watcher is active.
+    /// Live in-memory index. Exposed so tests (and the TUI) can run
+    /// queries while the watcher is active.
     pub state: Arc<IndexState>,
+    /// Running counters of writer-thread activity. The TUI samples
+    /// these every tick to render the indexer status bar; tests can
+    /// poll them to assert convergence.
+    pub progress: Arc<IndexProgress>,
 }
 
 impl WatchHandle {
@@ -335,7 +339,7 @@ pub fn run_watch(db_path: &Path, root: &Path, opts: &WatchOptions) -> Result<Wat
 
     // ---- Long-lived DB writer ------------------------------------------
     let (writer_tx, writer_rx) = flume::bounded::<WriterMsg>(64);
-    let counters = Arc::new(WriterCounters::default());
+    let counters = Arc::new(IndexProgress::default());
     let writer_db_path = db_path.to_path_buf();
     let writer_state = state.clone();
     let writer_counters = counters.clone();
@@ -366,6 +370,7 @@ pub fn run_watch(db_path: &Path, root: &Path, opts: &WatchOptions) -> Result<Wat
     let coord_pool = pool.clone();
     let coord_writer_tx = writer_tx.clone();
     let coord_stop = stop.clone();
+    let coord_progress = counters.clone();
     let coordinator = thread::Builder::new()
         .name("pdffff-watch-coordinator".into())
         .spawn(move || {
@@ -375,6 +380,7 @@ pub fn run_watch(db_path: &Path, root: &Path, opts: &WatchOptions) -> Result<Wat
                 coord_writer_tx,
                 stop_rx,
                 coord_stop,
+                coord_progress,
             )
         })
         .context("spawning watch coordinator")?;
@@ -390,6 +396,7 @@ pub fn run_watch(db_path: &Path, root: &Path, opts: &WatchOptions) -> Result<Wat
         writer: Some(writer_handle),
         _watcher: Some(watcher),
         state,
+        progress: counters,
     })
 }
 
@@ -410,6 +417,7 @@ fn coordinator_thread(
     writer_tx: flume::Sender<WriterMsg>,
     stop_rx: flume::Receiver<()>,
     stop: Arc<AtomicBool>,
+    progress: Arc<IndexProgress>,
 ) -> Result<()> {
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -442,7 +450,14 @@ fn coordinator_thread(
                     }
                 };
                 let tx = writer_tx.clone();
+                // Count this extraction as in-flight for the TUI's
+                // "indexing..." indicator. The closure decrements
+                // unconditionally on its way out so a hard extractor
+                // error does not leak a pending slot.
+                progress.pending.fetch_add(1, Ordering::Relaxed);
+                let job_progress = progress.clone();
                 pool.spawn(move || {
+                    let _guard = PendingGuard::new(&job_progress.pending);
                     let extracted = match extract_pdf(&job) {
                         Ok(d) => d,
                         Err(err) => {
@@ -467,6 +482,28 @@ fn coordinator_thread(
     // and exits.
     drop(writer_tx);
     Ok(())
+}
+
+/// RAII guard that decrements a `pending` atomic when dropped.
+///
+/// Used to ensure the coordinator's `progress.pending` counter is
+/// always decremented when an extractor closure finishes, regardless of
+/// which branch the closure takes (success, extract error, send
+/// failure, or panic).
+struct PendingGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl<'a> PendingGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        Self { counter }
+    }
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 fn default_pool_size() -> usize {
@@ -515,12 +552,25 @@ enum WriterMsg {
     Delete(PathBuf),
 }
 
+/// Running counters of indexer activity.
+///
+/// Updated from the watcher's coordinator (for `pending`) and from the
+/// DB writer thread (for the terminal-status counters). All fields are
+/// observable from any thread, including the TUI's render loop, so
+/// they are atomics rather than counters guarded by a mutex.
+///
+/// `pending` is "extraction jobs the coordinator has dispatched to the
+/// rayon pool but for which the writer has not yet observed a `Doc`
+/// message" — it's the right cardinality for a "currently indexing"
+/// status bar but only meaningful in the long-lived watch pipeline.
+/// In the one-shot `run_index` path the field stays at zero throughout.
 #[derive(Default)]
-struct WriterCounters {
-    ok: AtomicUsize,
-    empty: AtomicUsize,
-    error: AtomicUsize,
-    deleted: AtomicUsize,
+pub struct IndexProgress {
+    pub ok: AtomicUsize,
+    pub empty: AtomicUsize,
+    pub error: AtomicUsize,
+    pub deleted: AtomicUsize,
+    pub pending: AtomicUsize,
 }
 
 /// Run the DB writer until the channel disconnects.
@@ -536,7 +586,7 @@ struct WriterCounters {
 fn writer_thread(
     db_path: PathBuf,
     rx: flume::Receiver<WriterMsg>,
-    counters: Arc<WriterCounters>,
+    counters: Arc<IndexProgress>,
     live_state: Option<Arc<IndexState>>,
 ) -> Result<()> {
     let mut db = Db::open(&db_path).context("writer thread: opening SQLite")?;

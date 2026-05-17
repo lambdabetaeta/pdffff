@@ -62,6 +62,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Time / printing
 humantime = "2"
 
+# TUI
+ratatui   = "0.29"
+crossterm = "0.28"
+
 [dev-dependencies]
 tempfile    = "3"
 printpdf    = "0.7"

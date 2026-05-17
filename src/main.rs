@@ -8,9 +8,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use owo_colors::OwoColorize;
+use std::fs::OpenOptions;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -19,6 +20,7 @@ use pdffff::db::Db;
 use pdffff::extract::{ensure_pdftotext_available, extractor_version_or_missing};
 use pdffff::query::{DISPLAY_LIMIT, Hit, QueryMode, search};
 use pdffff::scanner::Scanner;
+use pdffff::tui::{TuiOptions, run_tui};
 
 #[derive(Parser, Debug)]
 #[command(name = "pdffff", version, about = "Durable, fast PDF folder search")]
@@ -88,6 +90,43 @@ enum Command {
         #[arg(long)]
         debounce_ms: Option<u64>,
     },
+    /// Interactive fzf-style TUI: watch a folder and search live.
+    ///
+    /// Runs the same scan + watch + extractor pool that `watch` does,
+    /// but renders a full-screen terminal UI for typing queries and
+    /// browsing hits. The indexer keeps running in the background so
+    /// the displayed results reflect the current on-disk state. Press
+    /// Ctrl+C, Esc, Ctrl+D, or Ctrl+Q to quit cleanly — the watcher
+    /// stops, the writer drains its queue, and the SQLite database
+    /// is left in a consistent state on every commit boundary.
+    Tui {
+        /// Directory to watch recursively.
+        root: PathBuf,
+        /// Respect .gitignore / .ignore files.
+        #[arg(long)]
+        respect_ignore: bool,
+        /// Follow symlinks.
+        #[arg(long)]
+        follow_symlinks: bool,
+        /// Override extractor pool size. Default: min(num_cpus, 6).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Watcher debounce window in milliseconds. Default: 200 ms.
+        #[arg(long)]
+        debounce_ms: Option<u64>,
+        /// Initial query mode. Tab cycles literal → regex → fuzzy
+        /// while the UI is running.
+        #[arg(long, value_enum, default_value_t = CliQueryMode::Literal)]
+        mode: CliQueryMode,
+        /// Cap on number of hits surfaced per query.
+        #[arg(long, default_value_t = DISPLAY_LIMIT)]
+        limit: usize,
+        /// Tracing log file. When the TUI is active stderr is taken
+        /// over by the alternate screen, so logs go here instead.
+        /// Default: $TMPDIR/pdffff-tui.log.
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+    },
     /// Search the indexed corpus.
     ///
     /// Three modes are supported: literal (the default), regex, and
@@ -153,10 +192,14 @@ impl CliQueryMode {
 }
 
 fn main() -> Result<()> {
-    fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .init();
     let cli = Cli::parse();
+    // The TUI takes over stderr (alternate screen + raw mode), so we
+    // route tracing to a file for that path and to stderr for every
+    // other subcommand.
+    match &cli.command {
+        Command::Tui { log_file, .. } => init_tracing_to_file(log_file.as_deref())?,
+        _ => init_tracing_to_stderr(),
+    }
     match cli.command {
         Command::Scan {
             root,
@@ -176,6 +219,25 @@ fn main() -> Result<()> {
             jobs,
             debounce_ms,
         } => cmd_watch(&cli.db, &root, respect_ignore, follow_symlinks, jobs, debounce_ms),
+        Command::Tui {
+            root,
+            respect_ignore,
+            follow_symlinks,
+            jobs,
+            debounce_ms,
+            mode,
+            limit,
+            log_file: _,
+        } => cmd_tui(
+            &cli.db,
+            &root,
+            respect_ignore,
+            follow_symlinks,
+            jobs,
+            debounce_ms,
+            mode,
+            limit,
+        ),
         Command::Search {
             query,
             mode,
@@ -186,6 +248,32 @@ fn main() -> Result<()> {
         Command::Info => cmd_info(&cli.db),
         Command::Diagnose => cmd_diagnose(&cli.db),
     }
+}
+
+fn init_tracing_to_stderr() {
+    fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .init();
+}
+
+/// Tracing subscriber that writes to `path` (or `$TMPDIR/pdffff-tui.log`
+/// by default). Keeps the TUI's alternate screen clean. The file is
+/// opened in append mode and shared across all spans via a `Mutex`.
+fn init_tracing_to_file(path: Option<&Path>) -> Result<()> {
+    let default_path = std::env::temp_dir().join("pdffff-tui.log");
+    let path = path.unwrap_or(&default_path);
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening tracing log file {}", path.display()))?;
+    let writer = Mutex::new(file);
+    fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_writer(writer)
+        .with_ansi(false)
+        .init();
+    Ok(())
 }
 
 /// True iff stdout is a real terminal and `NO_COLOR` is not set.
@@ -431,6 +519,47 @@ fn cmd_watch(
         }
     }
     handle.stop()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_tui(
+    db_path: &PathBuf,
+    root: &PathBuf,
+    respect_ignore: bool,
+    follow_symlinks: bool,
+    jobs: Option<usize>,
+    debounce_ms: Option<u64>,
+    mode: CliQueryMode,
+    limit: usize,
+) -> Result<()> {
+    // The watch pipeline performs an initial sync before returning the
+    // WatchHandle; on a fresh corpus that can take a while. We can't
+    // render the TUI before the handle exists (we'd have nothing to
+    // search against), so print a one-line note to the user before
+    // taking over the terminal.
+    eprintln!("syncing {} (initial scan + extract) …", root.display());
+    let opts = WatchOptions {
+        respect_gitignore: respect_ignore,
+        follow_symlinks,
+        jobs,
+        require_pdftotext: true,
+        debounce: debounce_ms.map(Duration::from_millis),
+    };
+    let handle = run_watch(db_path, root, &opts)?;
+
+    let tui_opts = TuiOptions {
+        limit,
+        initial_mode: mode.to_query_mode(),
+        root: root.clone(),
+    };
+    let chosen = run_tui(handle, tui_opts)?;
+    if let Some(hit) = chosen {
+        // After teardown we are back on the original screen; printing
+        // the path to stdout here makes `pdffff tui` usable in shell
+        // pipelines (e.g. piped into `xargs open`).
+        println!("{}", hit.path);
+    }
     Ok(())
 }
 
