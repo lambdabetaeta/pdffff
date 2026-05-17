@@ -13,15 +13,21 @@
 //!     * Regex: a compiled `regex::Regex` matched against `text_utf8`,
 //!       with `case_insensitive(true)` so the engine's notion of case
 //!       matches the lowercase-only bigram decomposition.
-//!     * Fuzzy: `neo_frizbee`'s parallel match call over a synthetic
-//!       "rank string" of `"{filename} {path} page {page_no}
-//!       {preview}"`. Above [`FRIZBEE_LIMIT`] candidates we fall back
-//!       to a cheap deterministic ordering.
+//!     * Fuzzy: two bands. A *filename band* of one hit per doc whose
+//!       normalised filename contains every query term as a substring
+//!       (ranked by earliest-match offset, then filename length); and
+//!       a *body band* of `neo_frizbee`'s parallel match call over a
+//!       synthetic "rank string" of `"{filename} {path} page {page_no}
+//!       {preview}"` over the remaining chunks. Above [`FRIZBEE_LIMIT`]
+//!       body candidates we fall back to a cheap deterministic
+//!       ordering. The filename band is concatenated *before* the body
+//!       band, so filename matches always outrank body-only matches.
 //! 3. **Overflow pass.** Mode-specific candidate set:
 //!     * Literal: use the query's deduped bigram set against
 //!       `Overlay::overflow_matches`.
 //!     * Regex: conservatively check every overflow row.
-//!     * Fuzzy: include every overflow row.
+//!     * Fuzzy: include every overflow row except those whose doc
+//!       is already represented in the filename band.
 //!
 //! The base index and the overlay are read under a single
 //! `state.overlay.read()` guard that brackets both verification passes
@@ -486,6 +492,70 @@ mod tests {
         assert!(
             paths.contains(&"/papers/Streicher - 1994 - A universality.pdf"),
             "expected the Streicher 1994 paper in fuzzy results, got {paths:?}",
+        );
+    }
+
+    #[test]
+    fn fuzzy_filename_match_outranks_body_match() {
+        // Doc A: filename matches the query, body does not.
+        // Doc B: filename does NOT match, body contains the query
+        // verbatim — so neo_frizbee scores it very highly on body.
+        // Expectation: the filename-band hit comes first regardless.
+        let state = synthetic_state(vec![
+            mk_chunk(1, 1, "/papers/Streicher-1994.pdf", 1, "totally unrelated body text"),
+            mk_chunk(2, 2, "/papers/other.pdf", 1, "this chunk repeatedly says streicher streicher streicher"),
+        ]);
+        let hits = search(&state, "streicher", QueryMode::Fuzzy, 10).unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(
+            hits[0].path, "/papers/Streicher-1994.pdf",
+            "filename-matched doc must rank above the body-only match, got order {:?}",
+            hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn fuzzy_filename_match_contributes_one_hit_per_doc() {
+        // The filename-matched doc has many chunks. Only one should
+        // surface in the filename band; the doc's other chunks must
+        // not flood the result list.
+        let state = synthetic_state(vec![
+            mk_chunk(1, 1, "/papers/thesis-final.pdf", 1, "chunk one of thesis"),
+            mk_chunk(2, 1, "/papers/thesis-final.pdf", 2, "chunk two of thesis"),
+            mk_chunk(3, 1, "/papers/thesis-final.pdf", 3, "chunk three of thesis"),
+            mk_chunk(4, 2, "/papers/other.pdf", 1, "an unrelated chunk"),
+        ]);
+        let hits = search(&state, "thesis", QueryMode::Fuzzy, 10).unwrap();
+        let from_doc1 = hits.iter().filter(|h| h.doc_id == 1).count();
+        assert_eq!(
+            from_doc1, 1,
+            "filename-matched doc must contribute exactly one hit, got {} (paths: {:?})",
+            from_doc1,
+            hits.iter().map(|h| (h.doc_id, h.page_no)).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn fuzzy_filename_band_ranks_shorter_or_earlier_matches_first() {
+        // Both filenames match "streicher", but one is short and the
+        // term appears at offset 0; the other buries the term deep
+        // inside a long name. The compact, early-match filename wins.
+        let state = synthetic_state(vec![
+            mk_chunk(
+                1,
+                1,
+                "/papers/long-prefix-that-buries-the-author-streicher.pdf",
+                1,
+                "body text",
+            ),
+            mk_chunk(2, 2, "/papers/streicher.pdf", 1, "body text"),
+        ]);
+        let hits = search(&state, "streicher", QueryMode::Fuzzy, 10).unwrap();
+        assert!(hits.len() >= 2);
+        assert_eq!(
+            hits[0].path, "/papers/streicher.pdf",
+            "shorter / earlier-match filename should rank first, got {:?}",
+            hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
         );
     }
 
