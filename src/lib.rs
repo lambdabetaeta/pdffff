@@ -22,11 +22,14 @@
 //! * [`bigram_query`] – regex/fuzzy → bigram-query decomposition and evaluation.
 //! * [`index`]        – `BaseIndex` + `Overlay` glued together with `arc-swap`.
 //! * [`query`]        – literal / regex / fuzzy search with snippet rendering.
-//! * [`app`]          – top-level orchestrator (`run_index`, `run_search`,
-//!   `run_watch`, `run_rebuild`).
+//! * [`app`]          – top-level orchestrator (`run_watch`, `resolve_db_path`).
 //!
-//! The binary in `src/main.rs` is a thin clap wrapper around the `run_*`
-//! functions in [`app`]. The library never writes to stdout itself.
+//! The binary in `src/main.rs` is a pure-TUI launcher: it resolves the
+//! per-corpus DB path, redirects tracing to a log file, calls
+//! [`app::run_watch`] (which returns immediately and indexes
+//! progressively in the background), and hands the resulting
+//! `WatchHandle` to [`tui::run_tui`]. The library never writes to
+//! stdout itself.
 
 pub mod app;
 pub mod bigram;
