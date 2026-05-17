@@ -100,10 +100,12 @@ const SPINNER_FRAMES: [&str; 10] =
 /// Brand accent. Used for the pdffff pill, prompt, key chips, and
 /// the LITERAL mode pill.
 const ACCENT: Color = Color::Cyan;
-/// Subtle dim — borders, meta text, middot separators.
-const DIM: Color = Color::DarkGray;
+/// Subtle dim — borders, meta text, middot separators. We use the
+/// regular ANSI gray (7) rather than "bright black" (8 / DarkGray)
+/// because the latter is near-invisible on true-black terminals.
+const DIM: Color = Color::Gray;
 /// Border colour for the outer frame and the inline separator.
-const BORDER: Color = Color::DarkGray;
+const BORDER: Color = Color::Gray;
 /// Selection background for the currently-highlighted hit. Indexed
 /// 237 is a near-black grey on a 256-colour terminal which contrasts
 /// gently with most themes; it falls back to terminal default on
