@@ -22,6 +22,23 @@
 //! every successful mutation to SQLite synchronously, so the only
 //! work shutdown has to do is signal the threads to drain and join.
 //!
+//! Concurrency
+//! -----------
+//! Searches do not run on the input thread. A dedicated
+//! [`SearchWorker`] thread owns an `Arc<IndexState>` and a one-slot
+//! mailbox: every keystroke / mode change overwrites the slot, so a
+//! burst of input (typing, key-repeat on Backspace) coalesces into the
+//! *latest* query rather than running a full search per key. The worker
+//! publishes its result into a `Mutex<Option<…>>`; the render loop
+//! polls that mutex each iteration. A monotonic stamp on every request
+//! is echoed back so we drop results for queries the user has already
+//! moved past.
+//!
+//! Net effect: keystrokes never block on a search, and a long-running
+//! search against a large corpus does not freeze the UI — the
+//! coordinator / writer / extractor threads from `run_watch` continue
+//! to index in the background while the TUI stays responsive.
+//!
 //! Shutdown
 //! --------
 //! All four exit keys (`Ctrl+C`, `Ctrl+D`, `Ctrl+Q`, `Esc`) take the
@@ -62,6 +79,7 @@ use crossterm::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     },
 };
+use parking_lot::{Condvar, Mutex};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -77,6 +95,7 @@ use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::app::{IndexProgress, WatchHandle};
@@ -197,9 +216,15 @@ struct AppState {
     /// input line so the user can see what's wrong without losing
     /// their typed text.
     last_error: Option<String>,
-    /// How many search calls have been completed in this session.
-    /// Used to assert progress and report on quit.
-    search_count: u64,
+    /// Monotonic stamp bumped on every query / mode edit. Submitted to
+    /// the worker and echoed back in the result so we can drop hits for
+    /// queries the user has already moved past.
+    submitted_stamp: u64,
+    /// Stamp of the result currently displayed in `hits`. When this
+    /// trails `submitted_stamp` a search is in flight on the worker —
+    /// we leave the previous hits on screen rather than blanking the
+    /// list so the UI never goes empty between keystrokes.
+    applied_stamp: u64,
     /// Wall-clock of the last spinner advance.
     spinner_started: Instant,
     /// True once the user has pressed one of the quit keys.
@@ -217,7 +242,8 @@ impl AppState {
             hits: Vec::new(),
             list_state: ListState::default(),
             last_error: None,
-            search_count: 0,
+            submitted_stamp: 0,
+            applied_stamp: 0,
             spinner_started: Instant::now(),
             should_quit: false,
             chosen: None,
@@ -239,41 +265,52 @@ fn main_loop(
     handle: &WatchHandle,
     opts: &TuiOptions,
 ) -> Result<Option<Hit>> {
+    let worker = SearchWorker::spawn(handle.state.clone())
+        .context("spawning TUI search worker")?;
+    // Run the loop body in a helper so worker shutdown happens on every
+    // exit path (including `?` propagation), without a Drop guard.
+    let outcome = run_event_loop(terminal, &worker, &handle.progress, opts);
+    worker.stop();
+    outcome
+}
+
+fn run_event_loop(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    worker: &SearchWorker,
+    progress: &IndexProgress,
+    opts: &TuiOptions,
+) -> Result<Option<Hit>> {
     let mut state = AppState::new(opts.initial_mode);
-    let progress = handle.progress.clone();
-    let index_state = handle.state.clone();
 
     // Snapshot of indexer counters at the last tick, so we can also
     // redraw the screen when the indexer makes progress in the
     // background (otherwise the status bar would only update on
     // keystroke).
-    let mut last_progress_snapshot = snapshot_progress(&progress);
+    let mut last_progress_snapshot = snapshot_progress(progress);
 
-    run_query(&mut state, &index_state, opts.limit);
-    terminal.draw(|f| render(f, &state, opts, &progress))?;
+    terminal.draw(|f| render(f, &state, opts, progress))?;
 
     while !state.should_quit {
-        if event::poll(TICK)? {
+        let had_event = event::poll(TICK)?;
+        if had_event {
             match event::read()? {
-                Event::Key(key) => handle_key(key, &mut state, &index_state, opts),
+                Event::Key(key) => handle_key(key, &mut state, worker, opts),
                 Event::Resize(_, _) => {}
                 _ => {}
             }
-            terminal.draw(|f| render(f, &state, opts, &progress))?;
-            last_progress_snapshot = snapshot_progress(&progress);
-        } else {
-            // No input within TICK: redraw only if the indexer status
-            // has changed (so the spinner / counts stay live without
-            // burning the terminal on a fully-idle corpus).
-            let snap = snapshot_progress(&progress);
-            if snap != last_progress_snapshot {
-                terminal.draw(|f| render(f, &state, opts, &progress))?;
-                last_progress_snapshot = snap;
-            } else if snap.pending > 0 {
-                // Still need to spin the indicator while extractors are
-                // busy even when the counters themselves don't tick.
-                terminal.draw(|f| render(f, &state, opts, &progress))?;
-            }
+        }
+        let got_result = drain_results(&mut state, worker);
+        let snap = snapshot_progress(progress);
+        // Redraw if anything visible could have changed: user input,
+        // a fresh search result, the indexer counters ticked, or the
+        // extractor pool is still busy (spinner needs to keep moving).
+        if had_event
+            || got_result
+            || snap != last_progress_snapshot
+            || snap.pending > 0
+        {
+            terminal.draw(|f| render(f, &state, opts, progress))?;
+            last_progress_snapshot = snap;
         }
     }
 
@@ -302,7 +339,7 @@ fn snapshot_progress(progress: &IndexProgress) -> ProgressSnapshot {
 fn handle_key(
     key: KeyEvent,
     state: &mut AppState,
-    index_state: &Arc<IndexState>,
+    worker: &SearchWorker,
     opts: &TuiOptions,
 ) {
     // Both `Press` and `Repeat` are user-driven; ignore `Release` so we
@@ -318,13 +355,13 @@ fn handle_key(
         KeyCode::Char('c' | 'd' | 'q') if ctrl => state.should_quit = true,
 
         // ---- editing -----------------------------------------------------
-        KeyCode::Char('u') if ctrl => edit_and_search(state, index_state, opts, String::clear),
-        KeyCode::Char('w') if ctrl => edit_and_search(state, index_state, opts, word_erase),
-        KeyCode::Backspace => edit_and_search(state, index_state, opts, |q| {
+        KeyCode::Char('u') if ctrl => edit_and_search(state, worker, opts, String::clear),
+        KeyCode::Char('w') if ctrl => edit_and_search(state, worker, opts, word_erase),
+        KeyCode::Backspace => edit_and_search(state, worker, opts, |q| {
             q.pop();
         }),
         KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
-            edit_and_search(state, index_state, opts, |q| q.push(c));
+            edit_and_search(state, worker, opts, |q| q.push(c));
         }
 
         // ---- navigation --------------------------------------------------
@@ -338,7 +375,7 @@ fn handle_key(
         // ---- modes -------------------------------------------------------
         KeyCode::Tab => {
             state.cycle_mode();
-            run_query(state, index_state, opts.limit);
+            submit_query(state, worker, opts.limit);
         }
 
         // ---- pick a hit --------------------------------------------------
@@ -355,20 +392,20 @@ fn handle_key(
     }
 }
 
-/// Mutate `state.query` through `edit` then re-run the search.
+/// Mutate `state.query` through `edit` and submit a fresh search.
 ///
 /// Every editing key (clear / word-erase / backspace / character
 /// insert) follows the same shape; centralising it keeps the four
 /// branches in `handle_key` to one line each and ensures no future
-/// editing key can forget to re-run the search.
+/// editing key can forget to dispatch a search.
 fn edit_and_search(
     state: &mut AppState,
-    index_state: &Arc<IndexState>,
+    worker: &SearchWorker,
     opts: &TuiOptions,
     edit: impl FnOnce(&mut String),
 ) {
     edit(&mut state.query);
-    run_query(state, index_state, opts.limit);
+    submit_query(state, worker, opts.limit);
 }
 
 /// Drop the trailing whitespace-bounded word from `q`.
@@ -395,25 +432,51 @@ fn move_selection(state: &mut AppState, delta: isize) {
     state.list_state.select(Some(next as usize));
 }
 
-/// Run the search against the current `query` / `mode` and update
-/// `state.hits` + selection in place.
-fn run_query(state: &mut AppState, index_state: &Arc<IndexState>, limit: usize) {
-    state.search_count = state.search_count.wrapping_add(1);
+/// Bump the query stamp and either clear the UI (empty query) or hand
+/// the work to the [`SearchWorker`]. Never blocks: the worker may still
+/// be busy on an older query — its mailbox is one-slot, so this just
+/// overwrites the pending request.
+fn submit_query(state: &mut AppState, worker: &SearchWorker, limit: usize) {
+    state.submitted_stamp = state.submitted_stamp.wrapping_add(1);
     if state.query.trim().is_empty() {
         state.hits.clear();
         state.list_state.select(None);
         state.last_error = None;
+        state.applied_stamp = state.submitted_stamp;
         return;
     }
-    match search(index_state, &state.query, state.mode, limit) {
+    worker.submit(SearchRequest {
+        stamp: state.submitted_stamp,
+        query: state.query.clone(),
+        mode: state.mode,
+        limit,
+    });
+}
+
+/// Pull any pending result from the worker and apply it. Returns true
+/// when a fresh result was applied so the caller knows to redraw.
+///
+/// Results whose stamp predates `state.submitted_stamp` (i.e. the user
+/// has typed more or cleared the query in the meantime) are dropped on
+/// the floor — we never paint hits that no longer match the visible
+/// query.
+fn drain_results(state: &mut AppState, worker: &SearchWorker) -> bool {
+    let Some(result) = worker.take_result() else {
+        return false;
+    };
+    if result.stamp != state.submitted_stamp {
+        return false;
+    }
+    state.applied_stamp = result.stamp;
+    match result.hits {
         Ok(hits) => {
             state.hits = hits;
             state.last_error = None;
-            if state.hits.is_empty() {
-                state.list_state.select(None);
+            state.list_state.select(if state.hits.is_empty() {
+                None
             } else {
-                state.list_state.select(Some(0));
-            }
+                Some(0)
+            });
         }
         Err(err) => {
             // Surface the error without nuking the previous hits — that
@@ -421,6 +484,135 @@ fn run_query(state: &mut AppState, index_state: &Arc<IndexState>, limit: usize) 
             // keystroke.
             state.last_error = Some(format!("{err:#}"));
         }
+    }
+    true
+}
+
+// ──────────────────────────── search worker ────────────────────────
+//
+// A single background thread owns the `Arc<IndexState>` and runs
+// searches off the input thread. The TUI talks to it through a one-slot
+// mailbox: every submission overwrites the pending request, so a burst
+// of keystrokes (typing, key-repeat on Backspace) collapses to a single
+// search of the *latest* query. This is the entire point of the
+// concurrency layer — it's what keeps Backspace instant on a corpus
+// large enough that one search takes hundreds of milliseconds.
+
+/// A single pending search submitted to the worker.
+#[derive(Debug, Clone)]
+struct SearchRequest {
+    stamp: u64,
+    query: String,
+    mode: QueryMode,
+    limit: usize,
+}
+
+/// A search the worker has finished, ready for the TUI to apply.
+struct SearchResult {
+    stamp: u64,
+    hits: Result<Vec<Hit>>,
+}
+
+/// One-slot mailbox guarded by a condvar.
+///
+/// `pending` is the next request to run; the worker takes it and runs
+/// it, then loops back to wait for the next. `closed` lets the TUI
+/// signal shutdown without sending a sentinel request.
+struct SearchSlot {
+    pending: Option<SearchRequest>,
+    closed: bool,
+}
+
+/// Handle held by the TUI. Drop / [`SearchWorker::stop`] tear down the
+/// background thread.
+struct SearchWorker {
+    slot: Arc<(Mutex<SearchSlot>, Condvar)>,
+    result: Arc<Mutex<Option<SearchResult>>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl SearchWorker {
+    fn spawn(state: Arc<IndexState>) -> Result<Self> {
+        let slot = Arc::new((
+            Mutex::new(SearchSlot {
+                pending: None,
+                closed: false,
+            }),
+            Condvar::new(),
+        ));
+        let result: Arc<Mutex<Option<SearchResult>>> = Arc::new(Mutex::new(None));
+        let slot_for_thread = slot.clone();
+        let result_for_thread = result.clone();
+        let handle = thread::Builder::new()
+            .name("pdffff-tui-search".into())
+            .spawn(move || worker_loop(state, slot_for_thread, result_for_thread))
+            .context("spawning pdffff-tui-search thread")?;
+        Ok(Self {
+            slot,
+            result,
+            handle: Some(handle),
+        })
+    }
+
+    /// Overwrite the pending slot with `req` and wake the worker. If the
+    /// worker is mid-search it finishes that search first; the new
+    /// request runs next. Older pending requests are dropped silently —
+    /// that's the coalescing behaviour the input thread depends on.
+    fn submit(&self, req: SearchRequest) {
+        let (m, cv) = &*self.slot;
+        let mut s = m.lock();
+        s.pending = Some(req);
+        cv.notify_one();
+    }
+
+    /// Pop the latest published result, if any.
+    fn take_result(&self) -> Option<SearchResult> {
+        self.result.lock().take()
+    }
+
+    /// Signal the worker to exit and join it. Idempotent; safe to call
+    /// from a drop guard or an explicit shutdown.
+    fn stop(mut self) {
+        {
+            let (m, cv) = &*self.slot;
+            let mut s = m.lock();
+            s.closed = true;
+            cv.notify_one();
+        }
+        if let Some(h) = self.handle.take() {
+            // Best-effort: a worker panic would already have been
+            // surfaced through `result` as an `Err`, so a Join error
+            // here is purely shutdown noise we don't want to leak into
+            // the TUI's exit path.
+            let _ = h.join();
+        }
+    }
+}
+
+fn worker_loop(
+    state: Arc<IndexState>,
+    slot: Arc<(Mutex<SearchSlot>, Condvar)>,
+    result: Arc<Mutex<Option<SearchResult>>>,
+) {
+    let (m, cv) = &*slot;
+    loop {
+        let request = {
+            let mut s = m.lock();
+            loop {
+                if s.closed {
+                    return;
+                }
+                if let Some(r) = s.pending.take() {
+                    break r;
+                }
+                cv.wait(&mut s);
+            }
+        };
+        let hits = search(&state, &request.query, request.mode, request.limit);
+        *result.lock() = Some(SearchResult {
+            stamp: request.stamp,
+            hits,
+        });
     }
 }
 

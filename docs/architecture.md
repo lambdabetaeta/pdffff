@@ -79,10 +79,29 @@ notify-debouncer-full thread
                                           └── Removed(path): writer Delete
 ```
 
+The TUI adds one more thread on top of `run_watch`:
+
+```
+input thread (event::poll / read)
+   └── overwrites one-slot mailbox ──► search worker thread
+                                            └── query::search against IndexState
+                                                   └── publishes SearchResult
+                                                          back into a Mutex slot
+```
+
+A monotonic stamp on every submission lets the input thread drop results
+for queries it has already moved past, so the screen never paints hits
+that don't match the visible query. The mailbox is one-slot by design:
+a burst of keystrokes (typing, key-repeat on Backspace) coalesces to a
+single search of the latest query rather than running one search per
+key. This is what keeps Backspace instant on a corpus large enough that
+one fuzzy search takes hundreds of milliseconds.
+
 Synchronization primitives, exactly as the report names them:
 
 * `arc-swap::ArcSwap<BaseIndex>` for the atomic base-index swap.
 * `parking_lot::RwLock<Overlay>` for the small mutable overlay.
+* `parking_lot::{Mutex, Condvar}` for the TUI search-worker mailbox.
 * `flume::bounded` for `ScanJob` / `ExtractedDoc` / `WriterMsg` / `WatchEvent`.
 * `AtomicU64::fetch_or` inside the bigram builder for race-free dense writes
   without `unsafe`.
