@@ -13,11 +13,13 @@
 use anyhow::Result;
 use ignore::WalkBuilder;
 use std::collections::HashMap;
+use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::db::{Db, DocStatus, DocumentRow, EXTRACTOR_NAME, extractor_version};
 use crate::normalize::NORM_VERSION;
+use crate::paths::is_pdf;
 
 /// Why a scan decided a file needed extraction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,14 +54,46 @@ pub struct ScanResult {
     pub seen_count: usize,
 }
 
+/// Compact view of a regular file's identity used to build a [`ScanJob`].
+///
+/// Sourced from a `std::fs::Metadata`; the conversion is centralised in
+/// [`file_identity`] so the walk-and-diff and single-path entry points
+/// agree on what counts as "the same file."
+struct FileIdentity {
+    size_bytes: i64,
+    mtime_ns: i64,
+    dev: Option<i64>,
+    ino: Option<i64>,
+}
+
+impl FileIdentity {
+    fn from(md: &Metadata) -> Self {
+        // `modified()` may not be supported on every filesystem; if it
+        // fails we record `0` so the next walk sees a different value
+        // any time the file is rewritten with a real mtime.
+        let mtime_ns = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        Self {
+            size_bytes: md.len() as i64,
+            mtime_ns,
+            dev: Some(md.dev() as i64),
+            ino: Some(md.ino() as i64),
+        }
+    }
+}
+
 /// Build a [`ScanJob`] for a single existing path. Used by the watcher
 /// coordinator to convert a Dirty(path) event into an extraction job
 /// without re-walking the tree.
 ///
 /// Returns `Ok(None)` if the path is not an existing regular file or
 /// not a `.pdf`; the coordinator silently drops those events.
-pub fn scan_one(path: &std::path::Path, reason: DirtyReason) -> Result<Option<ScanJob>> {
-    if !path.extension().is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("pdf")) {
+pub fn scan_one(path: &Path, reason: DirtyReason) -> Result<Option<ScanJob>> {
+    if !is_pdf(path) {
         return Ok(None);
     }
     let md = match path.metadata() {
@@ -70,21 +104,13 @@ pub fn scan_one(path: &std::path::Path, reason: DirtyReason) -> Result<Option<Sc
     if !md.is_file() {
         return Ok(None);
     }
-    let size_bytes = md.len() as i64;
-    let mtime_ns = md
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0);
-    let dev = Some(md.dev() as i64);
-    let ino = Some(md.ino() as i64);
+    let id = FileIdentity::from(&md);
     Ok(Some(ScanJob {
         path: path.to_path_buf(),
-        size_bytes,
-        mtime_ns,
-        dev,
-        ino,
+        size_bytes: id.size_bytes,
+        mtime_ns: id.mtime_ns,
+        dev: id.dev,
+        ino: id.ino,
         reason,
     }))
 }
@@ -136,9 +162,7 @@ impl Scanner {
 
             // We only consider regular files with a `.pdf` extension.
             let path = entry.path();
-            if !path.extension().is_some_and(|e| {
-                e.to_string_lossy().eq_ignore_ascii_case("pdf")
-            }) {
+            if !is_pdf(path) {
                 continue;
             }
             let md = match entry.metadata() {
@@ -153,33 +177,25 @@ impl Scanner {
             }
 
             result.seen_count += 1;
-            let size_bytes = md.len() as i64;
-            let mtime_ns = md
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or(0);
-            let dev = Some(md.dev() as i64);
-            let ino = Some(md.ino() as i64);
+            let id = FileIdentity::from(&md);
 
             let abs_path = path.to_path_buf();
             let reason = match by_path.remove(&abs_path) {
                 None => Some(DirtyReason::New),
                 Some(row) => decide_dirty(
                     &row,
-                    size_bytes,
-                    mtime_ns,
+                    id.size_bytes,
+                    id.mtime_ns,
                     &cur_extractor_version,
                 ),
             };
             if let Some(reason) = reason {
                 result.jobs.push(ScanJob {
                     path: abs_path,
-                    size_bytes,
-                    mtime_ns,
-                    dev,
-                    ino,
+                    size_bytes: id.size_bytes,
+                    mtime_ns: id.mtime_ns,
+                    dev: id.dev,
+                    ino: id.ino,
                     reason,
                 });
             }

@@ -315,29 +315,16 @@ fn handle_key(
     match key.code {
         // ---- exit keys ----------------------------------------------------
         KeyCode::Esc => state.should_quit = true,
-        KeyCode::Char('c') if ctrl => state.should_quit = true,
-        KeyCode::Char('d') if ctrl => state.should_quit = true,
-        KeyCode::Char('q') if ctrl => state.should_quit = true,
+        KeyCode::Char('c' | 'd' | 'q') if ctrl => state.should_quit = true,
 
         // ---- editing -----------------------------------------------------
-        KeyCode::Char('u') if ctrl => {
-            state.query.clear();
-            run_query(state, index_state, opts.limit);
-        }
-        KeyCode::Char('w') if ctrl => {
-            // Word-erase: drop trailing whitespace, then the next run.
-            let trimmed_end = state.query.trim_end();
-            let cut_to = trimmed_end.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
-            state.query.truncate(cut_to);
-            run_query(state, index_state, opts.limit);
-        }
-        KeyCode::Backspace => {
-            state.query.pop();
-            run_query(state, index_state, opts.limit);
-        }
+        KeyCode::Char('u') if ctrl => edit_and_search(state, index_state, opts, String::clear),
+        KeyCode::Char('w') if ctrl => edit_and_search(state, index_state, opts, word_erase),
+        KeyCode::Backspace => edit_and_search(state, index_state, opts, |q| {
+            q.pop();
+        }),
         KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
-            state.query.push(c);
-            run_query(state, index_state, opts.limit);
+            edit_and_search(state, index_state, opts, |q| q.push(c));
         }
 
         // ---- navigation --------------------------------------------------
@@ -366,6 +353,35 @@ fn handle_key(
 
         _ => {}
     }
+}
+
+/// Mutate `state.query` through `edit` then re-run the search.
+///
+/// Every editing key (clear / word-erase / backspace / character
+/// insert) follows the same shape; centralising it keeps the four
+/// branches in `handle_key` to one line each and ensures no future
+/// editing key can forget to re-run the search.
+fn edit_and_search(
+    state: &mut AppState,
+    index_state: &Arc<IndexState>,
+    opts: &TuiOptions,
+    edit: impl FnOnce(&mut String),
+) {
+    edit(&mut state.query);
+    run_query(state, index_state, opts.limit);
+}
+
+/// Drop the trailing whitespace-bounded word from `q`.
+///
+/// Matches the readline / shell convention: trailing whitespace first,
+/// then everything back to the next whitespace boundary.
+fn word_erase(q: &mut String) {
+    let trimmed_end = q.trim_end();
+    let cut_to = trimmed_end
+        .rfind(char::is_whitespace)
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    q.truncate(cut_to);
 }
 
 fn move_selection(state: &mut AppState, delta: isize) {

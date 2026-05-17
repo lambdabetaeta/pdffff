@@ -16,6 +16,7 @@
 //! * [`db`]           – SQLite schema, migrations, and statements (durability).
 //! * [`extract`]      – `pdftotext` invocation, normalization, chunking.
 //! * [`normalize`]    – `deunicode` + lowercase + whitespace-collapse pipeline.
+//! * [`paths`]        – path-shape predicates (`is_pdf`).
 //! * [`scanner`]      – filesystem walk + diff against `documents`.
 //! * [`watcher`]      – debounced filesystem events feeding the scanner.
 //! * [`bigram`]       – dense bigram posting-list index over chunks.
@@ -38,6 +39,7 @@ pub mod db;
 pub mod extract;
 pub mod index;
 pub mod normalize;
+pub mod paths;
 pub mod query;
 pub mod scanner;
 pub mod tui;

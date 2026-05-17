@@ -74,6 +74,40 @@ pub fn normalize_query_ascii(query: &str) -> String {
     normalize_for_index(query)
 }
 
+/// Collapse runs of whitespace (and non-whitespace control characters)
+/// into a single space, trim trailing space.
+///
+/// Used for any text that will be written into a TUI cell. Control
+/// characters that are *not* whitespace per `char::is_whitespace` —
+/// ESC (`\x1b`), BEL (`\x07`), BS (`\x08`), and friends — are
+/// interpreted by the host terminal as escape sequences and corrupt
+/// the screen; treating them as whitespace at this boundary keeps the
+/// rendered text safe regardless of what the source contained.
+///
+/// Distinct from [`normalize_for_index`]: this preserves Unicode (we
+/// do not transliterate to ASCII or lowercase). It is the display-side
+/// analogue of [`normalize_for_index`]'s sanitisation.
+pub fn collapse_whitespace_for_display(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = true;
+    for ch in s.chars() {
+        let is_problem_ctrl = ch.is_control() && !ch.is_whitespace();
+        if ch.is_whitespace() || is_problem_ctrl {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,5 +137,31 @@ mod tests {
     #[test]
     fn empty_input() {
         assert_eq!(normalize_for_index(""), "");
+    }
+
+    #[test]
+    fn display_collapse_handles_control_chars() {
+        // ESC, BEL, BS must collapse to spaces so the TUI host
+        // terminal can't be tricked into running an escape sequence.
+        let s = "a\x1b[31mb\x1b[m\x07 c \x08d";
+        let out = collapse_whitespace_for_display(s);
+        assert!(!out.chars().any(|c| c.is_control() && !c.is_whitespace()));
+        // The visible letters survive, separated by spaces where
+        // control runs were collapsed.
+        assert_eq!(out, "a [31mb [m c d");
+    }
+
+    #[test]
+    fn display_collapse_runs_and_trims() {
+        assert_eq!(
+            collapse_whitespace_for_display("  hello\nworld\t\tfoo    bar  "),
+            "hello world foo bar",
+        );
+    }
+
+    #[test]
+    fn display_collapse_preserves_unicode() {
+        // Distinct from `normalize_for_index`: Unicode passes through.
+        assert_eq!(collapse_whitespace_for_display("café"), "café");
     }
 }

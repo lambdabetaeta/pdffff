@@ -34,6 +34,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, warn};
 
+use crate::paths::is_pdf;
+
 /// Default debounce window. Inside the report's 50–250 ms band.
 pub const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(200);
 
@@ -106,7 +108,7 @@ pub fn spawn_watcher(
 fn forward_event(tx: &flume::Sender<WatchEvent>, event: &notify::Event) {
     let event_kind = event.kind;
     for path in &event.paths {
-        if !is_pdf_path(path) {
+        if !is_pdf(path) {
             continue;
         }
         let we = match classify(event_kind, path) {
@@ -120,6 +122,21 @@ fn forward_event(tx: &flume::Sender<WatchEvent>, event: &notify::Event) {
             // until the debouncer is dropped.
             return;
         }
+    }
+}
+
+/// `Dirty(path)` if the file is on disk right now, else `Removed(path)`.
+///
+/// Several `notify` event kinds (`Create`/`Modify`/`Rename::Both` …)
+/// don't on their own tell us whether the target survives — both
+/// outcomes are legal interpretations of the raw event. A single
+/// `path.exists()` check at the boundary lets us collapse those
+/// branches into one logical decision.
+fn dirty_or_removed(path: &Path) -> WatchEvent {
+    if path.exists() {
+        WatchEvent::Dirty(path.to_path_buf())
+    } else {
+        WatchEvent::Removed(path.to_path_buf())
     }
 }
 
@@ -137,42 +154,21 @@ fn classify(kind: EventKind, path: &Path) -> Option<WatchEvent> {
             Some(WatchEvent::Removed(path.to_path_buf()))
         }
 
-        // Rename To / Both: the destination now exists, treat it as
-        // a new (dirty) file. `Both` carries both paths in
-        // `event.paths`, so the caller will emit two events for the
-        // (from, to) pair — one Removed and one Dirty. We use the
-        // path's current existence to disambiguate.
+        // Rename To: the destination now exists, treat as new (dirty).
         EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
             Some(WatchEvent::Dirty(path.to_path_buf()))
         }
-        EventKind::Modify(ModifyKind::Name(RenameMode::Both | RenameMode::Any | RenameMode::Other)) => {
-            if path.exists() {
-                Some(WatchEvent::Dirty(path.to_path_buf()))
-            } else {
-                Some(WatchEvent::Removed(path.to_path_buf()))
-            }
-        }
 
-        // Create / Modify / Other: if the file still exists, treat
-        // as Dirty. If it doesn't (rare race), treat as Removed so
-        // the index stays consistent.
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Other => {
-            if path.exists() {
-                Some(WatchEvent::Dirty(path.to_path_buf()))
-            } else {
-                Some(WatchEvent::Removed(path.to_path_buf()))
-            }
-        }
+        // Everything else where the meaning of "did the file survive?"
+        // is ambiguous: probe the filesystem once.
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both | RenameMode::Any | RenameMode::Other))
+        | EventKind::Create(_)
+        | EventKind::Modify(_)
+        | EventKind::Other => Some(dirty_or_removed(path)),
 
         // Access events do not affect the index.
         EventKind::Access(_) | EventKind::Any => None,
     }
-}
-
-/// True for paths whose extension equals `pdf` case-insensitively.
-fn is_pdf_path(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("pdf"))
 }
 
 #[cfg(test)]
@@ -186,15 +182,6 @@ mod tests {
             paths: vec![path],
             attrs: EventAttributes::default(),
         }
-    }
-
-    #[test]
-    fn is_pdf_path_is_case_insensitive() {
-        assert!(is_pdf_path(Path::new("foo.pdf")));
-        assert!(is_pdf_path(Path::new("FOO.PDF")));
-        assert!(is_pdf_path(Path::new("dir/sub/A.Pdf")));
-        assert!(!is_pdf_path(Path::new("foo.txt")));
-        assert!(!is_pdf_path(Path::new("foo")));
     }
 
     #[test]

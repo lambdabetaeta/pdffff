@@ -55,7 +55,7 @@ use tracing::warn;
 use crate::bigram::{BigramIndex, extract_bigrams};
 use crate::bigram_query::{fuzzy_to_bigram_query, regex_to_bigram_query};
 use crate::index::{BaseIndex, ChunkItem, IndexState, Overlay};
-use crate::normalize::normalize_query_ascii;
+use crate::normalize::{collapse_whitespace_for_display, normalize_query_ascii};
 
 /// Cap on the number of hits surfaced to the user in the TUI.
 pub const DISPLAY_LIMIT: usize = 200;
@@ -677,7 +677,7 @@ fn render_window(text: &str, centre: usize, match_len: usize) -> String {
     let right = (want_match_end + SNIPPET_CONTEXT_BYTES).min(text.len());
     let left = snap_char_boundary(text, left);
     let right = snap_char_boundary(text, right);
-    collapse_whitespace(&text[left..right])
+    collapse_whitespace_for_display(&text[left..right])
 }
 
 /// Move `idx` left until it lies on a UTF-8 char boundary (or 0).
@@ -689,37 +689,6 @@ fn snap_char_boundary(text: &str, mut idx: usize) -> usize {
         idx -= 1;
     }
     idx
-}
-
-fn collapse_whitespace(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut prev_space = true;
-    for ch in s.chars() {
-        // Treat both whitespace and non-whitespace control characters
-        // as space. Raw PDF text occasionally contains ESC (\x1b),
-        // backspace (\x08), bell (\x07), or other sub-0x20 bytes that
-        // are *not* whitespace per `char::is_whitespace`; rendered into
-        // a TUI cell they get interpreted by the host terminal as
-        // escape sequences / cursor moves and corrupt the screen
-        // (random letters re-flowing, beeps, half-erased cells). The
-        // safe thing is to normalise every control char to a space at
-        // the snippet boundary — the same rule the bigram normaliser
-        // uses for the indexed copy.
-        let is_problem_ctrl = ch.is_control() && !ch.is_whitespace();
-        if ch.is_whitespace() || is_problem_ctrl {
-            if !prev_space {
-                out.push(' ');
-                prev_space = true;
-            }
-        } else {
-            out.push(ch);
-            prev_space = false;
-        }
-    }
-    if out.ends_with(' ') {
-        out.pop();
-    }
-    out
 }
 
 #[cfg(test)]

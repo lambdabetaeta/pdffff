@@ -37,7 +37,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use crate::db::{ChunkInsert, DocStatus, EXTRACTOR_NAME, ExtractedDoc, extractor_version};
-use crate::normalize::{NORM_VERSION, normalize_for_index};
+use crate::normalize::{NORM_VERSION, collapse_whitespace_for_display, normalize_for_index};
 use crate::scanner::ScanJob;
 
 /// Window size (in Unicode chars) for chunking a long page.
@@ -352,36 +352,26 @@ fn build_chunk(
     })
 }
 
-/// Build a short head-of-chunk preview: take the first
-/// [`PREVIEW_MAX_BYTES`] ASCII-ish characters of `text_utf8`, collapse
-/// whitespace runs, trim ends.
+/// Build a short head-of-chunk preview: collapse whitespace runs, then
+/// take chars until the next one would push us past [`PREVIEW_MAX_BYTES`].
 fn make_preview(text: &str) -> String {
-    let mut out = String::with_capacity(PREVIEW_MAX_BYTES.min(text.len()));
-    let mut prev_space = true;
-    for ch in text.chars() {
-        if out.len() >= PREVIEW_MAX_BYTES {
+    take_chars_within_bytes(&collapse_whitespace_for_display(text), PREVIEW_MAX_BYTES)
+}
+
+/// Largest prefix of `s` whose UTF-8 encoding fits in `max_bytes`.
+///
+/// Walks character-by-character so we never split a multi-byte
+/// codepoint. The result is a fresh `String` rather than a `&str` slice
+/// because the only caller (`make_preview`) needs an owned string for
+/// the DB column.
+fn take_chars_within_bytes(s: &str, max_bytes: usize) -> String {
+    let mut out = String::with_capacity(max_bytes.min(s.len()));
+    for ch in s.chars() {
+        let need = ch.len_utf8();
+        if out.len() + need > max_bytes {
             break;
         }
-        let c = if ch.is_whitespace() { ' ' } else { ch };
-        if c == ' ' {
-            if !prev_space {
-                out.push(' ');
-                prev_space = true;
-            }
-        } else {
-            // If adding this char would overflow the byte budget, stop —
-            // we must not split a multi-byte char.
-            let mut buf = [0u8; 4];
-            let s = c.encode_utf8(&mut buf);
-            if out.len() + s.len() > PREVIEW_MAX_BYTES {
-                break;
-            }
-            out.push_str(s);
-            prev_space = false;
-        }
-    }
-    if out.ends_with(' ') {
-        out.pop();
+        out.push(ch);
     }
     out
 }
