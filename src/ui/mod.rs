@@ -18,3 +18,6 @@
 
 pub mod highlight;
 pub mod search;
+
+#[cfg(feature = "gui")]
+pub mod gui;
