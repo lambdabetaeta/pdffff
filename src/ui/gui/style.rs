@@ -7,24 +7,40 @@ use eframe::egui::{self, Color32, FontFamily, FontId, Stroke, TextStyle, Vec2};
 
 use super::palette::{FACE, FONT_BODY, FONT_HEADING, SELECT_NAVY};
 
-/// Add `Hack` to the `Proportional` font family's fallback chain.
+/// Add Braille-capable fallback fonts to the `Proportional` family.
 ///
 /// egui's default proportional font is `Ubuntu-Light`, which covers
 /// the western text we draw but lacks Dingbats (e.g. `❯` U+276F) and
 /// Braille Patterns (the spinner frames). egui only falls back along
 /// the *family* chain, never across families, so without this `❯`
-/// and `⠋..⠏` render as tofu on every platform where the system font
-/// cascade isn't reachable from inside the bundled font stack
-/// (notably macOS). `Hack` (the default monospace) covers both
-/// blocks; we insert it as the second entry in the chain so
-/// `Ubuntu-Light` stays primary for the bulk of glyphs and `Hack`
-/// picks up the holes.
+/// and `⠋..⠏` render as tofu wherever the system font cascade isn't
+/// reachable from inside the bundled font stack.
+///
+/// On Windows we load `Segoe UI Symbol` (system font with guaranteed
+/// Braille coverage). `Hack` covers both blocks on macOS/Linux and
+/// serves as a secondary fallback on Windows.
 pub fn apply_font_fallback(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
+
+    #[cfg(target_os = "windows")]
+    {
+        let sym_path = r"C:\Windows\Fonts\seguisym.ttf";
+        if let Ok(data) = std::fs::read(sym_path) {
+            fonts
+                .font_data
+                .insert("Segoe UI Symbol".to_string(), egui::FontData::from_owned(data));
+        }
+    }
+
     if let Some(chain) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-        if !chain.iter().any(|name| name == "Hack") {
-            let pos = chain.len().min(1);
-            chain.insert(pos, "Hack".to_string());
+        let mut ins = 1;
+        #[cfg(target_os = "windows")]
+        if !chain.iter().any(|n| n == "Segoe UI Symbol") {
+            chain.insert(ins, "Segoe UI Symbol".to_string());
+            ins += 1;
+        }
+        if !chain.iter().any(|n| n == "Hack") {
+            chain.insert(ins, "Hack".to_string());
         }
     }
     ctx.set_fonts(fonts);
