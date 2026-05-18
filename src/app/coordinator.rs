@@ -67,10 +67,7 @@ pub(crate) fn coordinator_thread(
             break;
         }
         let sel = flume::Selector::new()
-            .recv(&watch_rx, |r| match r {
-                Ok(ev) => Some(ev),
-                Err(_) => None,
-            })
+            .recv(&watch_rx, |r| r.ok())
             .recv(&stop_rx, |_| None);
         let Some(ev) = sel.wait() else {
             // Either stop was signalled or the watcher channel hung

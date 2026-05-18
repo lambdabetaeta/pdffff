@@ -15,6 +15,7 @@
 //!    * page text ≤ 1200 *chars* (Unicode scalar values) → one chunk;
 //!    * page text >  1200 chars  → sliding 1200-char windows with
 //!      200-char overlap (step = 1000 chars).
+//!
 //!    `char_start` / `char_end` are recorded as **byte** offsets into the
 //!    page's original UTF-8 text (which is what `text_utf8` is a slice of).
 //! 5. `preview` is a short head-of-chunk (≤ 200 chars of `text_utf8`) with
@@ -455,8 +456,8 @@ mod tests {
         let mut covered = vec![false; page.len()];
         for c in &chunks {
             assert!(c.char_end as usize - c.char_start as usize <= CHUNK_WINDOW_CHARS);
-            for i in c.char_start as usize..c.char_end as usize {
-                covered[i] = true;
+            for slot in &mut covered[c.char_start as usize..c.char_end as usize] {
+                *slot = true;
             }
         }
         assert!(covered.iter().all(|b| *b), "every byte must be in at least one chunk");

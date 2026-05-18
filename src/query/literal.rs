@@ -51,7 +51,7 @@ pub(super) fn literal_search(
     };
 
     let mut hits: Vec<Hit> = Vec::new();
-    walk_base_chunks(&base, &ov, &candidates, limit, &mut hits, &verify);
+    walk_base_chunks(&base, &ov, &candidates, limit, &mut hits, verify);
 
     if hits.len() < limit && !ov.overflow.is_empty() {
         let query_bigrams = extract_bigrams(needle);
@@ -60,7 +60,7 @@ pub(super) fn literal_search(
             ov.overflow_matches(&query_bigrams),
             limit,
             &mut hits,
-            &verify,
+            verify,
         );
     }
 

@@ -109,7 +109,12 @@ impl DocStatus {
             DocStatus::Deleted => "deleted",
         }
     }
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Parse the textual form persisted in `documents.status`. Returns
+    /// `None` for any value not produced by `as_str`. We do not
+    /// implement `std::str::FromStr` because the parse here is total in
+    /// our domain (any unknown text is treated as a corrupt row by the
+    /// loader) and the `Option` shape matches that contract better.
+    pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "ok" => DocStatus::Ok,
             "empty" => DocStatus::Empty,
@@ -208,7 +213,7 @@ impl Db {
                 extractor: row.get(4)?,
                 extractor_version: row.get(5)?,
                 norm_version: row.get(6)?,
-                status: DocStatus::from_str(&status).unwrap_or(DocStatus::Error),
+                status: DocStatus::parse(&status).unwrap_or(DocStatus::Error),
             })
         })?;
         let mut out = Vec::new();

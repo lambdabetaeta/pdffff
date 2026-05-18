@@ -253,7 +253,7 @@ fn build_filename_hits(
         });
     }
 
-    entries.sort_by(|a, b| a.score_key.cmp(&b.score_key));
+    entries.sort_by_key(|e| e.score_key);
 
     entries
         .into_iter()

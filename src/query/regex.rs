@@ -48,7 +48,7 @@ pub(super) fn regex_search(
     };
 
     let mut hits: Vec<Hit> = Vec::new();
-    walk_base_chunks(&base, &ov, &candidates, limit, &mut hits, &verify);
+    walk_base_chunks(&base, &ov, &candidates, limit, &mut hits, verify);
 
     // Overlay overflow: conservatively check every row. Regex bigrams
     // don't always survive overlay-side bigram dedup, so we let the
@@ -57,7 +57,7 @@ pub(super) fn regex_search(
     // bounded too.
     if hits.len() < limit {
         let all_overflow: Vec<usize> = (0..ov.overflow.len()).collect();
-        walk_overflow(&ov, all_overflow, limit, &mut hits, &verify);
+        walk_overflow(&ov, all_overflow, limit, &mut hits, verify);
     }
 
     hits.sort_by_key(|h| (h.doc_id, h.page_no, h.chunk_id));

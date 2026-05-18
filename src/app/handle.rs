@@ -29,6 +29,34 @@ pub struct IndexProgress {
     pub pending: AtomicUsize,
 }
 
+/// Plain-old-data snapshot of [`IndexProgress`].
+///
+/// `Copy + Eq` so the render loop can cache the previous tick and
+/// trigger a repaint only when something visible has changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProgressSnapshot {
+    pub ok: usize,
+    pub empty: usize,
+    pub error: usize,
+    pub deleted: usize,
+    pub pending: usize,
+}
+
+impl IndexProgress {
+    /// One coherent read of every counter. Each load is `Relaxed`
+    /// individually — that's enough for status-bar display, which has
+    /// no causal dependency on inter-counter ordering.
+    pub fn snapshot(&self) -> ProgressSnapshot {
+        ProgressSnapshot {
+            ok: self.ok.load(Ordering::Relaxed),
+            empty: self.empty.load(Ordering::Relaxed),
+            error: self.error.load(Ordering::Relaxed),
+            deleted: self.deleted.load(Ordering::Relaxed),
+            pending: self.pending.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Live handle exposed by [`super::run_watch`]. Owns every thread the
 /// watch loop spawned and signals them to shut down on
 /// [`WatchHandle::stop`].

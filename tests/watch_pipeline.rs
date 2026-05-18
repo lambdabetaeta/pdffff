@@ -70,7 +70,7 @@ fn wait_for(
     }
 }
 
-fn paths_in_hits<'a>(hits: &'a [Hit]) -> Vec<&'a str> {
+fn paths_in_hits(hits: &[Hit]) -> Vec<&str> {
     hits.iter().map(|h| h.path.as_str()).collect()
 }
 

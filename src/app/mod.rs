@@ -50,7 +50,7 @@ use coordinator::{ScanParams, coordinator_thread};
 use writer::{WriterMsg, writer_thread};
 
 pub use db_path::resolve_db_path;
-pub use handle::{IndexProgress, WatchHandle};
+pub use handle::{IndexProgress, ProgressSnapshot, WatchHandle};
 pub use options::WatchOptions;
 
 /// Wall-clock milliseconds since the Unix epoch. Used as `indexed_at_ms`
@@ -178,6 +178,8 @@ pub fn run_watch(db_path: &Path, root: &Path, opts: &WatchOptions) -> Result<Wat
 }
 
 fn default_pool_size() -> usize {
-    let n = thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
-    n.min(6).max(1)
+    thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(1, 6)
 }
