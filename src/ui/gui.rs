@@ -137,6 +137,10 @@ const HELPBAR_HEIGHT: f32 = 26.0;
 /// padding so all three states (LITERAL / REGEX / FUZZY) fit the
 /// same pill without resizing as the mode cycles.
 const MODE_PILL_W: f32 = 112.0;
+/// Prompt position width — wide enough to host the widest spinner
+/// frame without the cursor of the adjacent text-input jittering as
+/// the spinner animates.
+const PROMPT_W: f32 = 22.0;
 /// Body / button font size — the chunky end of "MS Sans Serif at
 /// 8pt", scaled up for legible nostalgia.
 const FONT_BODY: f32 = 15.0;
@@ -388,6 +392,12 @@ struct GuiApp {
     prev_selected: Option<usize>,
     last_error: Option<String>,
     submitted_stamp: u64,
+    /// Stamp of the most recent search result we *applied*. When this
+    /// trails `submitted_stamp` a search is in flight (or the latest
+    /// keystroke hasn't been picked up by the worker yet) — that's
+    /// the signal we hand to [`is_searching`](Self::is_searching) to
+    /// drive the prompt-position spinner.
+    applied_stamp: u64,
     spinner_started: Instant,
     /// Whether we've already grabbed initial keyboard focus for the
     /// query input. After the first frame the user owns focus; we do
@@ -423,6 +433,7 @@ impl GuiApp {
             prev_selected: None,
             last_error: None,
             submitted_stamp: 0,
+            applied_stamp: 0,
             spinner_started: Instant::now(),
             did_initial_focus: false,
             chosen,
@@ -446,6 +457,10 @@ impl GuiApp {
             self.hits.clear();
             self.selected = None;
             self.last_error = None;
+            // An empty query "completes" immediately — there's no
+            // worker round-trip — so mark this stamp as applied so
+            // the prompt spinner doesn't keep spinning forever.
+            self.applied_stamp = self.submitted_stamp;
             return;
         }
         if let Some(w) = &self.worker {
@@ -458,6 +473,12 @@ impl GuiApp {
         }
     }
 
+    /// True when the latest submitted query has not yet been answered
+    /// by the worker. Drives the prompt-position spinner.
+    fn is_searching(&self) -> bool {
+        self.applied_stamp != self.submitted_stamp
+    }
+
     fn drain_results(&mut self) {
         let Some(worker) = &self.worker else { return };
         let Some(result) = worker.take_result() else {
@@ -466,6 +487,7 @@ impl GuiApp {
         if result.stamp != self.submitted_stamp {
             return;
         }
+        self.applied_stamp = result.stamp;
         match result.hits {
             Ok(hits) => {
                 self.hits = hits;
@@ -714,15 +736,44 @@ impl GuiApp {
     /// never overlaps the text.
     fn render_input(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("❯")
-                    .color(Color32::BLACK)
-                    .size(FONT_BODY + 1.0)
-                    .strong(),
+            // Prompt position: a fixed-width box that holds either the
+            // chevron (idle) or a spinner frame (search in flight).
+            // Fixed-width so the cursor doesn't jitter as the glyph
+            // animates.
+            let prompt_char = if self.is_searching() {
+                let idx = (self.spinner_started.elapsed().as_millis() / 100) as usize
+                    % SPINNER_FRAMES.len();
+                SPINNER_FRAMES[idx]
+            } else {
+                "❯"
+            };
+            let prompt_font = FontId::new(FONT_BODY + 1.0, FontFamily::Proportional);
+            let (prompt_rect, _) = ui.allocate_exact_size(
+                Vec2::new(PROMPT_W, 30.0),
+                Sense::hover(),
             );
+            let prompt_painter = ui.painter_at(prompt_rect);
+            let galley = prompt_painter.layout_no_wrap(
+                prompt_char.to_string(),
+                prompt_font,
+                Color32::BLACK,
+            );
+            let prompt_pos = Pos2::new(
+                prompt_rect.center().x - galley.size().x / 2.0,
+                prompt_rect.center().y - galley.size().y / 2.0,
+            );
+            prompt_painter.galley(prompt_pos, galley, Color32::BLACK);
 
+            // Width budget for the input well. egui's horizontal
+            // layout inserts an `item_spacing.x` between every two
+            // items, *including* before the mode pill and around
+            // `add_space`. We have to subtract both item_spacings
+            // explicitly or the pill overflows the right edge.
+            let item_spacing = ui.spacing().item_spacing.x;
             let pill_w = MODE_PILL_W;
-            let well_target_w = ui.available_width() - pill_w - 12.0;
+            let between = item_spacing + 12.0 + item_spacing;
+            let well_target_w = (ui.available_width() - pill_w - between).max(40.0);
+
             let inner = egui::Frame::none()
                 .fill(Color32::WHITE)
                 .inner_margin(egui::Margin {
