@@ -9,7 +9,6 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -94,41 +93,10 @@ fn main() -> Result<()> {
         initial_mode: cli.mode.to_query_mode(),
         root: cli.root.clone(),
     };
-    let chosen = run_gui(handle, gui_opts)?;
-    if let Some(hit) = chosen {
-        if let Err(err) = open_in_system_viewer(&hit.path) {
-            eprintln!("could not launch system PDF viewer: {err:#}");
-            println!("{}", hit.path);
-        }
-    }
-    Ok(())
-}
-
-fn open_in_system_viewer(path: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut cmd = {
-        let mut c = Command::new("open");
-        c.arg(path);
-        c
-    };
-    #[cfg(target_os = "windows")]
-    let mut cmd = {
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", "", path]);
-        c
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let mut cmd = {
-        let mut c = Command::new("xdg-open");
-        c.arg(path);
-        c
-    };
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("launching system viewer for {path}"))?;
-    Ok(())
+    // Activating a hit now opens the file in the host's PDF viewer
+    // without exiting the GUI; the launcher just runs the session
+    // until the user closes the window.
+    run_gui(handle, gui_opts)
 }
 
 fn init_tracing_to_file(path: Option<&Path>) -> Result<()> {

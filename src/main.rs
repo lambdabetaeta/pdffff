@@ -17,14 +17,15 @@
 //!    the coordinator streams dirty PDFs into the live index in the
 //!    background as `pdftotext` extractions finish.
 //! 4. Hands the resulting `WatchHandle` to [`pdffff::tui::run_tui`].
-//! 5. On TUI exit, prints the chosen hit's path (if Enter was pressed
-//!    on a result) so the launcher is usable in shell pipelines.
+//!    Enter on a selected result hands the path to the host's PDF
+//!    viewer via [`pdffff::ui::launch::open_in_system_viewer`] while
+//!    the TUI keeps running; the launcher returns only when the user
+//!    explicitly quits.
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -122,56 +123,10 @@ fn main() -> Result<()> {
         initial_mode: cli.mode.to_query_mode(),
         root: cli.root.clone(),
     };
-    let chosen = run_tui(handle, tui_opts)?;
-    if let Some(hit) = chosen {
-        // After teardown we are back on the original screen. Hand the
-        // chosen path to the system PDF viewer so the user lands
-        // straight in their reader; fall back to printing the path
-        // when the viewer cannot be launched (e.g. xdg-open missing on
-        // a headless box) so the launcher stays usable.
-        if let Err(err) = open_in_system_viewer(&hit.path) {
-            eprintln!("could not launch system PDF viewer: {err:#}");
-            println!("{}", hit.path);
-        }
-    }
-    Ok(())
-}
-
-/// Hand `path` to the platform's "open this file with whatever the
-/// user has registered" command. Returns once the helper has been
-/// spawned — we deliberately do not `wait()`, since GUI viewers
-/// typically detach and we want to return control to the shell.
-///
-/// On Linux this is `xdg-open`; on macOS `open`; on Windows we shell
-/// out to `cmd /C start` so file-association handling matches a
-/// double-click. Stdin/out/err are nulled so a viewer that prints to
-/// the terminal cannot corrupt the user's shell after pdffff exits.
-fn open_in_system_viewer(path: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut cmd = {
-        let mut c = Command::new("open");
-        c.arg(path);
-        c
-    };
-    #[cfg(target_os = "windows")]
-    let mut cmd = {
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", "", path]);
-        c
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let mut cmd = {
-        let mut c = Command::new("xdg-open");
-        c.arg(path);
-        c
-    };
-
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("launching system viewer for {path}"))?;
-    Ok(())
+    // Enter on a hit now opens the file in the host's PDF viewer
+    // without exiting the TUI; the launcher just runs the session
+    // until the user quits via Esc / Ctrl+C/D/Q.
+    run_tui(handle, tui_opts)
 }
 
 /// Tracing subscriber that writes to `path` (or `$TMPDIR/pdffff.log`

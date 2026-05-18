@@ -17,6 +17,7 @@
 //! kernel.
 
 pub mod highlight;
+pub mod launch;
 pub mod search;
 
 #[cfg(feature = "gui")]

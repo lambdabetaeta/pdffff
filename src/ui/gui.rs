@@ -58,7 +58,6 @@ use eframe::egui::{
     self, Color32, FontFamily, FontId, Painter, Pos2, Rect, RichText, Sense, Stroke,
     TextEdit, TextStyle, Ui, Vec2,
 };
-use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -67,6 +66,7 @@ use std::time::{Duration, Instant};
 use crate::app::{IndexProgress, WatchHandle};
 use crate::query::{DISPLAY_LIMIT, Hit, QueryMode};
 use crate::ui::highlight::{SegmentKind, highlight_segments};
+use crate::ui::launch::open_in_system_viewer;
 use crate::ui::search::{SearchRequest, SearchWorker};
 
 // ───────────────────────── Windows 95 palette ───────────────────────
@@ -109,8 +109,13 @@ const ERROR_BG: Color32 = Color32::from_rgb(0x80, 0x00, 0x00);
 /// "shadowed menu" was a recognised period UI effect).
 const SHADOW: Color32 = Color32::from_rgb(0x00, 0x00, 0x00);
 
+// Braille spinner — same set the TUI uses, so the search-activity
+// signal looks identical between the two frontends. The default
+// proportional font (Ubuntu-Light) does not cover Braille Patterns;
+// `apply_win95_visuals` extends the family's fallback chain with
+// `Hack` so these glyphs render on every platform.
 const SPINNER_FRAMES: [&str; 10] =
-    ["|", "/", "-", "\\", "|", "/", "-", "\\", "*", "+"];
+    ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 // ────────────────────────── spacing / sizing ────────────────────────
 //
@@ -175,10 +180,7 @@ impl Default for GuiOptions {
 /// indexer threads on the way out, returns `Some(hit)` if the user
 /// activated a result so the caller can hand it to the system PDF
 /// viewer.
-pub fn run_gui(handle: WatchHandle, opts: GuiOptions) -> Result<Option<Hit>> {
-    let chosen: Arc<Mutex<Option<Hit>>> = Arc::new(Mutex::new(None));
-    let chosen_for_app = chosen.clone();
-
+pub fn run_gui(handle: WatchHandle, opts: GuiOptions) -> Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1020.0, 720.0])
@@ -192,20 +194,43 @@ pub fn run_gui(handle: WatchHandle, opts: GuiOptions) -> Result<Option<Hit>> {
         "pdffff",
         native_options,
         Box::new(move |cc| {
+            apply_font_fallback(&cc.egui_ctx);
             apply_win98_visuals(&cc.egui_ctx);
-            let app = GuiApp::new(handle, opts_for_app, chosen_for_app, cc.egui_ctx.clone())?;
+            let app = GuiApp::new(handle, opts_for_app, cc.egui_ctx.clone())?;
             Ok(Box::new(app))
         }),
     )
     .map_err(|e| anyhow!("eframe::run_native: {e}"))?;
 
-    let result = chosen.lock().take();
-    Ok(result)
+    Ok(())
 }
 
 // ─────────────────────────── styling ────────────────────────────────
 
-/// Stamp every egui surface with the Win98/NT look. Called once at
+/// Add `Hack` to the `Proportional` font family's fallback chain.
+///
+/// egui's default proportional font is `Ubuntu-Light`, which covers
+/// the western text we draw but lacks Dingbats (e.g. `❯` U+276F) and
+/// Braille Patterns (the spinner frames). egui only falls back along
+/// the *family* chain, never across families, so without this `❯`
+/// and `⠋..⠏` render as tofu on every platform where the system font
+/// cascade isn't reachable from inside the bundled font stack
+/// (notably macOS). `Hack` (the default monospace) covers both
+/// blocks; we insert it as the second entry in the chain so
+/// `Ubuntu-Light` stays primary for the bulk of glyphs and `Hack`
+/// picks up the holes.
+fn apply_font_fallback(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(chain) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        if !chain.iter().any(|name| name == "Hack") {
+            let pos = chain.len().min(1);
+            chain.insert(pos, "Hack".to_string());
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
+/// Stamp every egui surface with the Win9x look. Called once at
 /// `CreationContext`; `set_visuals` / `set_style` apply globally for
 /// the life of the window.
 ///
@@ -404,9 +429,6 @@ struct GuiApp {
     /// not steal it back on every repaint.
     did_initial_focus: bool,
 
-    // Communication out: written when the user activates a result.
-    chosen: Arc<Mutex<Option<Hit>>>,
-
     // True once we've requested the system window to close.
     closing: bool,
 }
@@ -415,7 +437,6 @@ impl GuiApp {
     fn new(
         handle: WatchHandle,
         opts: GuiOptions,
-        chosen: Arc<Mutex<Option<Hit>>>,
         _ctx: egui::Context,
     ) -> Result<Self> {
         let progress = handle.progress.clone();
@@ -436,7 +457,6 @@ impl GuiApp {
             applied_stamp: 0,
             spinner_started: Instant::now(),
             did_initial_focus: false,
-            chosen,
             closing: false,
         })
     }
@@ -522,11 +542,22 @@ impl GuiApp {
         self.selected = Some(next as usize);
     }
 
+    /// Hand the selected result's path to the system PDF viewer. The
+    /// session stays open afterwards — the user can keep searching
+    /// and open more results. Errors from the viewer surface in the
+    /// in-screen error pill (the GUI owns the window and cannot
+    /// print to stderr).
     fn pick_selected(&mut self) {
         if let Some(i) = self.selected {
             if let Some(hit) = self.hits.get(i) {
-                *self.chosen.lock() = Some(hit.clone());
-                self.closing = true;
+                if let Err(err) = open_in_system_viewer(&hit.path) {
+                    self.last_error = Some(format!(
+                        "could not open {}: {err:#}",
+                        hit.path
+                    ));
+                } else {
+                    self.last_error = None;
+                }
             }
         }
     }

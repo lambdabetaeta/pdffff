@@ -20,7 +20,7 @@
 //!  │  ╭ 2. other.pdf ──────────────────── p. 1 · #0 · score 1247 ──────╮   │
 //!  │  │  …another snippet…                                              │  │
 //!  │  ╰─────────────────────────────────────────────────────────────────╯  │
-//!  ╰─ ↑↓ select · Tab mode · Enter pick · Ctrl+U clear · Esc quit ─────────╯
+//!  ╰─ ↑↓ select · Tab mode · Enter open · Ctrl+U clear · Esc quit ─────────╯
 //! ```
 //!
 //! The TUI owns a [`WatchHandle`] from [`crate::app::run_watch`]: the
@@ -102,6 +102,7 @@ use std::time::{Duration, Instant};
 use crate::app::{IndexProgress, WatchHandle};
 use crate::query::{DISPLAY_LIMIT, Hit, QueryMode};
 use crate::ui::highlight::{SegmentKind, SnippetSegment, highlight_segments};
+use crate::ui::launch::open_in_system_viewer;
 use crate::ui::search::{SearchRequest, SearchWorker};
 
 /// How often (at most) we redraw the screen when no key is pressed.
@@ -170,10 +171,12 @@ impl Default for TuiOptions {
 /// occurs. Owns `handle`: calls [`WatchHandle::stop`] on the way out
 /// so the index threads always shut down cleanly, even on panic.
 ///
-/// Returns `Some(hit)` when the user pressed Enter on a result so the
-/// caller can print the chosen path after the terminal has been
-/// restored; `None` on plain quit.
-pub fn run_tui(handle: WatchHandle, opts: TuiOptions) -> Result<Option<Hit>> {
+/// Pressing Enter on a selected result hands the path to the host's
+/// default PDF viewer via [`crate::ui::launch::open_in_system_viewer`]
+/// without ending the session — the user can keep searching and open
+/// further results. Errors from the launcher surface in the in-screen
+/// error pill rather than corrupting the alternate-screen output.
+pub fn run_tui(handle: WatchHandle, opts: TuiOptions) -> Result<()> {
     let mut terminal = setup_terminal().context("entering TUI terminal mode")?;
     install_panic_hook();
 
@@ -189,10 +192,10 @@ pub fn run_tui(handle: WatchHandle, opts: TuiOptions) -> Result<Option<Hit>> {
     // the writer thread has finished draining its queue.
     let stop_result = handle.stop();
 
-    let chosen = loop_result?;
+    loop_result?;
     teardown?;
     stop_result?;
-    Ok(chosen)
+    Ok(())
 }
 
 /// Internal state of the render loop.
@@ -223,9 +226,6 @@ struct AppState {
     scroll_top: usize,
     /// True once the user has pressed one of the quit keys.
     should_quit: bool,
-    /// If Enter was pressed, the path:page:chunk of the hit the user
-    /// selected. Printed to stdout after [`run_tui`] returns.
-    chosen: Option<Hit>,
 }
 
 impl AppState {
@@ -241,8 +241,13 @@ impl AppState {
             spinner_started: Instant::now(),
             scroll_top: 0,
             should_quit: false,
-            chosen: None,
         }
+    }
+
+    /// True when the latest submitted query has not yet been answered
+    /// by the worker. Drives the prompt-position spinner.
+    fn is_searching(&self) -> bool {
+        self.applied_stamp != self.submitted_stamp
     }
 
     /// Cycle Literal → Regex → Fuzzy → Literal.
@@ -259,7 +264,7 @@ fn main_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     handle: &WatchHandle,
     opts: &TuiOptions,
-) -> Result<Option<Hit>> {
+) -> Result<()> {
     let worker = SearchWorker::spawn(handle.state.clone())
         .context("spawning TUI search worker")?;
     // Run the loop body in a helper so worker shutdown happens on every
@@ -274,7 +279,7 @@ fn run_event_loop(
     worker: &SearchWorker,
     progress: &IndexProgress,
     opts: &TuiOptions,
-) -> Result<Option<Hit>> {
+) -> Result<()> {
     let mut state = AppState::new(opts.initial_mode);
 
     // Snapshot of indexer counters at the last tick, so we can also
@@ -309,7 +314,7 @@ fn run_event_loop(
         }
     }
 
-    Ok(state.chosen)
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -374,11 +379,21 @@ fn handle_key(
         }
 
         // ---- pick a hit --------------------------------------------------
+        // Pressing Enter on a selected result hands the path to the
+        // host's PDF viewer and keeps the search session running, so
+        // multiple files can be opened in sequence. Errors surface in
+        // the in-screen error pill rather than corrupting stderr.
         KeyCode::Enter => {
             if let Some(idx) = state.list_state.selected() {
                 if let Some(hit) = state.hits.get(idx) {
-                    state.chosen = Some(hit.clone());
-                    state.should_quit = true;
+                    if let Err(err) = open_in_system_viewer(&hit.path) {
+                        state.last_error = Some(format!(
+                            "could not open {}: {err:#}",
+                            hit.path
+                        ));
+                    } else {
+                        state.last_error = None;
+                    }
                 }
             }
         }
@@ -576,7 +591,7 @@ fn build_outer_frame<'a>(
         key_chip("Tab"),
         Span::raw(" mode  "),
         key_chip("Enter"),
-        Span::raw(" pick  "),
+        Span::raw(" open  "),
         key_chip("Ctrl+U"),
         Span::raw(" clear  "),
         key_chip("Esc"),
@@ -627,8 +642,20 @@ fn render_input(f: &mut Frame, area: Rect, state: &AppState) {
         ])
         .split(area);
 
+    // Prompt glyph: chevron when idle, animated spinner frame while a
+    // search is in flight. Same `applied_stamp != submitted_stamp`
+    // contract as the GUI's prompt spinner — drains the same one-slot
+    // worker mailbox.
+    let prompt_glyph = if state.is_searching() {
+        let idx = (state.spinner_started.elapsed().as_millis() / TICK.as_millis())
+            as usize
+            % SPINNER_FRAMES.len();
+        SPINNER_FRAMES[idx]
+    } else {
+        "❯"
+    };
     let prompt = Span::styled(
-        "❯ ",
+        format!("{prompt_glyph} "),
         Style::default().fg(CHROME).add_modifier(Modifier::BOLD),
     );
     let query = Span::styled(
