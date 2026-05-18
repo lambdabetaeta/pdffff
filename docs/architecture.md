@@ -1,9 +1,7 @@
 # pdffff architecture
 
-This is the developer-facing companion to
-[`deep-research-report.md`](../deep-research-report.md). The report
-specifies *what* to build and *why*; this file says *where* each piece
-lives in the source tree and what its surface is.
+The developer-facing source-tree map: *where* each piece lives and
+what its surface is.
 
 ## The boundary
 

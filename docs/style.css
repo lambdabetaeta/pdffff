@@ -1,0 +1,444 @@
+/* pdffff — landing page stylesheet
+ * minimal, modern, classy. one HTML, one CSS, no JS, no external fonts.
+ * Light mode by default with a paper-warm palette; honours
+ * prefers-color-scheme: dark for the system-dark crowd.
+ */
+
+:root {
+  /* Palette — warm paper-and-ink with a single saturated accent.
+     The navy comes straight from the Win95 active-title colour the
+     GUI uses, but at very small doses (links, the brand mark, focus
+     rings) so the page stays modern rather than period.            */
+  --bg:        #faf8f4;
+  --bg-soft:   #f1ede4;
+  --bg-code:   #1a1614;
+  --fg:        #1a1614;
+  --fg-soft:   #4d4944;
+  --fg-faint:  #807a72;
+  --rule:      #d8d2c4;
+  --accent:    #1a3a52;
+  --accent-h:  #0e2438;
+  --hl:        #f5d56b;
+  --hl-strong: #e6a200;
+  --code-bg:   #efeae0;
+  --code-fg:   #2a221e;
+
+  /* Type stack — system-ui prioritised so it picks up SF Pro on
+     macOS, Segoe UI on Windows, the system sans on Linux. Inter is
+     a graceful fallback. The mono stack favours the well-spaced
+     developer monos (JetBrains, IBM Plex, Source Code Pro) before
+     falling back to system. */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+               "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, "JetBrains Mono", "IBM Plex Mono",
+               "Source Code Pro", "Menlo", "Consolas", monospace;
+
+  --radius: 4px;
+  --max-w:  900px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:        #14110e;
+    --bg-soft:   #1e1a16;
+    --bg-code:   #0c0a08;
+    --fg:        #ece4d4;
+    --fg-soft:   #b8aea0;
+    --fg-faint:  #807468;
+    --rule:      #2b251f;
+    --accent:    #7fb4d4;
+    --accent-h:  #aacde5;
+    --hl:        #f5d56b;
+    --hl-strong: #e6a200;
+    --code-bg:   #1c1814;
+    --code-fg:   #ece4d4;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 17px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* A barely-perceptible vertical paper grain. Linear so it doesn't
+     bleed into the content; opacity capped so it reads as texture
+     rather than a band. */
+  background-image:
+    linear-gradient(180deg, var(--bg) 0%, var(--bg-soft) 100%);
+  background-attachment: fixed;
+}
+
+/* ─── site chrome ─── */
+
+.site-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 2rem;
+  max-width: var(--max-w);
+  margin: 0 auto;
+  padding: 1.75rem 1.5rem 1rem;
+  border-bottom: 1px solid var(--rule);
+}
+
+.brand {
+  text-decoration: none;
+  color: var(--fg);
+}
+
+.brand-mark {
+  font-family: var(--font-mono);
+  font-size: 1.1rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  padding: 0.2rem 0.55rem;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  border-radius: var(--radius);
+}
+
+.site-nav {
+  display: flex;
+  gap: 1.5rem;
+  font-size: 0.95rem;
+}
+
+.site-nav a {
+  color: var(--fg-soft);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+
+.site-nav a:hover,
+.site-nav a:focus-visible {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  outline: none;
+}
+
+main {
+  max-width: var(--max-w);
+  margin: 0 auto;
+  padding: 0 1.5rem;
+}
+
+/* ─── hero ─── */
+
+.hero {
+  padding: 4.5rem 0 2.5rem;
+}
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-faint);
+  margin: 0 0 1.5rem;
+}
+
+.hero h1 {
+  font-size: clamp(2rem, 5.5vw, 3.4rem);
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  margin: 0 0 1.5rem;
+  font-weight: 700;
+}
+
+.hero-accent {
+  display: block;
+  color: var(--accent);
+  font-style: italic;
+  font-weight: 500;
+}
+
+.lede {
+  font-size: 1.15rem;
+  line-height: 1.6;
+  color: var(--fg-soft);
+  max-width: 60ch;
+  margin: 0 0 2rem;
+}
+
+.cta-row {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.cta {
+  display: inline-block;
+  padding: 0.65rem 1.25rem;
+  border-radius: var(--radius);
+  font-weight: 600;
+  text-decoration: none;
+  font-size: 0.95rem;
+  transition: background 120ms ease, color 120ms ease,
+              border-color 120ms ease, transform 80ms ease;
+}
+
+.cta.primary {
+  background: var(--accent);
+  color: var(--bg);
+  border: 1px solid var(--accent);
+}
+
+.cta.primary:hover,
+.cta.primary:focus-visible {
+  background: var(--accent-h);
+  border-color: var(--accent-h);
+  outline: none;
+}
+
+.cta.ghost {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--rule);
+}
+
+.cta.ghost:hover,
+.cta.ghost:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.cta:active { transform: translateY(1px); }
+
+/* ─── demo screen ─── */
+
+.demo {
+  margin: 1rem 0 4rem;
+}
+
+.screen {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.45;
+  background: var(--bg-code);
+  color: #e8e0d0;
+  padding: 1.5rem 1.25rem;
+  border-radius: var(--radius);
+  overflow-x: auto;
+  margin: 0;
+  border: 1px solid var(--rule);
+  box-shadow:
+    0 1px 2px rgba(0,0,0,0.05),
+    0 4px 16px rgba(26, 58, 82, 0.08);
+}
+
+.screen .chrome         { color: #2f6caa; }
+.screen .chrome-strong  { color: #4d8fd1; font-weight: 700; }
+.screen .primary        { color: #f4ede0; font-weight: 600; }
+.screen .dim            { color: #908674; }
+.screen .accent         { color: #62b8d8; }
+.screen .path           { color: #f4ede0; font-weight: 500; }
+.screen .pill           { color: #14110e; background: #4d8fd1; padding: 0 0.35em; border-radius: 2px; font-weight: 700; }
+.screen .rule           { color: #2f6caa; }
+.screen .sel            { color: #d97fa6; font-weight: 600; }
+.screen .hl             { color: #14110e; background: var(--hl); font-weight: 700; padding: 0 0.15em; }
+.screen .cursor         { color: #f4ede0; }
+
+/* ─── features grid ─── */
+
+.section-heading {
+  font-size: 1.65rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0 0 2rem;
+  padding-top: 3rem;
+  border-top: 1px solid var(--rule);
+}
+
+.features { margin-bottom: 4rem; }
+
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1.75rem;
+}
+
+.feature h3 {
+  margin: 0 0 0.6rem;
+  font-size: 1.1rem;
+  font-weight: 700;
+  letter-spacing: -0.005em;
+  color: var(--accent);
+}
+
+.feature p {
+  margin: 0;
+  color: var(--fg-soft);
+  font-size: 0.97rem;
+  line-height: 1.6;
+}
+
+/* ─── prose sections ─── */
+
+.install, .use, .how { margin-bottom: 4rem; }
+
+.prose {
+  max-width: 65ch;
+  color: var(--fg-soft);
+  line-height: 1.65;
+  margin: 0 0 1.5rem;
+}
+
+.footnote {
+  margin: 1rem 0 0;
+  font-size: 0.9rem;
+  color: var(--fg-faint);
+  max-width: 65ch;
+  line-height: 1.6;
+}
+
+.footnote a { color: var(--accent); }
+
+/* ─── code ─── */
+
+.codeblock {
+  font-family: var(--font-mono);
+  font-size: 0.86rem;
+  line-height: 1.6;
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1rem 1.1rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--rule);
+  overflow-x: auto;
+  margin: 0 0 1.5rem;
+}
+
+.codeblock .comment { color: var(--fg-faint); font-style: italic; }
+
+code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.1em 0.35em;
+  border-radius: 3px;
+  border: 1px solid var(--rule);
+}
+
+a code { color: inherit; }
+
+/* ─── keys ─── */
+
+.keys dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.5rem 1.5rem;
+  margin: 2rem 0;
+  align-items: baseline;
+}
+
+.keys dt {
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+
+.keys dd {
+  margin: 0;
+  color: var(--fg-soft);
+}
+
+kbd {
+  font-family: var(--font-mono);
+  font-size: 0.82em;
+  background: var(--bg);
+  border: 1px solid var(--rule);
+  border-bottom-width: 2px;
+  border-radius: 3px;
+  padding: 0.05em 0.45em;
+  color: var(--fg);
+  display: inline-block;
+  min-width: 1.4em;
+  text-align: center;
+}
+
+/* ─── callout ─── */
+
+.callout {
+  background: var(--bg-soft);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 1.25rem 1.5rem;
+  margin: 2rem 0;
+}
+
+.callout h4 {
+  margin: 0 0 0.6rem;
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: -0.005em;
+  color: var(--accent);
+}
+
+.callout p {
+  margin: 0 0 1rem;
+  color: var(--fg-soft);
+  max-width: 60ch;
+}
+
+.callout .codeblock { margin: 0; }
+
+/* ─── footer ─── */
+
+.site-footer {
+  border-top: 1px solid var(--rule);
+  margin-top: 5rem;
+  padding: 2.5rem 1.5rem 3rem;
+  background: var(--bg-soft);
+}
+
+.footer-inner {
+  max-width: var(--max-w);
+  margin: 0 auto;
+  color: var(--fg-soft);
+  font-size: 0.9rem;
+  line-height: 1.7;
+}
+
+.footer-inner a { color: var(--accent); }
+
+.footer-inner .thin {
+  margin-top: 1rem;
+  color: var(--fg-faint);
+  font-size: 0.85rem;
+}
+
+/* ─── shared link styling ─── */
+
+a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+  transition: color 120ms ease;
+}
+
+a:hover,
+a:focus-visible {
+  color: var(--accent-h);
+  outline: none;
+}
+
+/* ─── responsive tightening ─── */
+
+@media (max-width: 540px) {
+  .site-header { padding: 1.25rem 1.25rem 0.85rem; gap: 1rem; }
+  .site-nav { flex-wrap: wrap; gap: 0.85rem; font-size: 0.88rem; }
+  .hero { padding: 3rem 0 2rem; }
+  .screen { font-size: 0.7rem; padding: 1rem 0.8rem; }
+  .keys dl { grid-template-columns: 1fr; gap: 0.25rem 0; }
+  .keys dt { margin-top: 0.6rem; }
+}

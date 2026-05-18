@@ -1,9 +1,9 @@
 //! SQLite-backed durability layer.
 //!
-//! Schema mirrors `deep-research-report.md`: `documents` carries the
-//! re-extraction contract (extractor + norm version + file identity);
-//! `chunks` carries display text plus search-normalized text. WAL mode +
-//! `synchronous=NORMAL` matches rga's choice.
+//! `documents` carries the re-extraction contract (extractor + norm
+//! version + file identity); `chunks` carries display text plus
+//! search-normalized text. WAL mode + `synchronous=NORMAL` matches
+//! rga's choice.
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};

@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pdffff — durable, fast PDF folder search</title>
+  <meta name="description" content="Point pdffff at a folder of PDFs and it indexes, watches, and searches as you type — literal, regex, or fuzzy — in milliseconds. TUI and Win95-flavoured desktop GUI.">
+  <meta name="theme-color" content="#1a3a52">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="brand" href="#top" aria-label="pdffff home">
+    <span class="brand-mark">pdffff</span>
+  </a>
+  <nav class="site-nav" aria-label="Primary">
+    <a href="#features">Features</a>
+    <a href="#install">Install</a>
+    <a href="#use">Use</a>
+    <a href="#how">How</a>
+    <a href="https://github.com/lambdabetaeta/pdffff">GitHub →</a>
+  </nav>
+</header>
+
+<main id="top">
+
+  <section class="hero">
+    <p class="eyebrow">Local-first PDF search · no daemon · one binary</p>
+    <h1>
+      Search a folder of PDFs
+      <span class="hero-accent">as fast as you can type.</span>
+    </h1>
+    <p class="lede">
+      Point <code>pdffff</code> at a folder, it indexes, watches, and
+      searches in milliseconds — literal, regex, or fuzzy — through a
+      Norton-Commander-flavoured terminal UI or a Win95-flavoured
+      desktop window. Results are durable in SQLite, the index lives
+      in RAM, and a debounced watcher keeps both honest as the folder
+      changes.
+    </p>
+    <div class="cta-row">
+      <a class="cta primary" href="#install">Get started</a>
+      <a class="cta ghost" href="https://github.com/lambdabetaeta/pdffff">Source on GitHub</a>
+    </div>
+  </section>
+
+  <section class="demo" aria-label="TUI demo">
+    <pre class="screen" role="img" aria-label="ASCII rendering of the pdffff TUI">
+<span class="chrome">╭─</span> <span class="chrome-strong">pdffff</span> <span class="path">/papers</span> <span class="chrome">─────────────────</span> <span class="dim">123 ok · 0 err · </span><span class="accent">⠿</span><span class="dim"> indexing 3</span> <span class="chrome">─╮</span>
+<span class="chrome">│</span>                                                                       <span class="chrome">│</span>
+<span class="chrome">│</span>  <span class="chrome-strong">❯</span> <span class="primary">alpha synthesis</span><span class="cursor">▏</span>                                       <span class="pill">LITERAL</span>  <span class="chrome">│</span>
+<span class="chrome">│</span>  <span class="rule">───────────────────────────────────────────────────────────────────</span>  <span class="chrome">│</span>
+<span class="chrome">│</span>                                                                       <span class="chrome">│</span>
+<span class="chrome">│</span>  <span class="sel">╭ 1. <span class="hl">alpha-synthesis</span>-paper.pdf ───────────────── p.12 · #3 ───╮</span>  <span class="chrome">│</span>
+<span class="chrome">│</span>  <span class="sel">│  …a deeper look at <span class="hl">alpha synthesis</span> in pre-WW1 chemistry…   │</span>  <span class="chrome">│</span>
+<span class="chrome">│</span>  <span class="sel">╰─────────────────────────────────────────────────────────────────╯</span>  <span class="chrome">│</span>
+<span class="chrome">│</span>                                                                       <span class="chrome">│</span>
+<span class="chrome">│</span>  <span class="chrome">╭ 2. routes-to-<span class="hl">synthesis</span>.pdf ──────────────────── p.1 · #0 ──────╮</span>  <span class="chrome">│</span>
+<span class="chrome">│</span>  <span class="chrome">│  …industrial routes to <span class="hl">synthesis</span> remain dominated by…          │</span>  <span class="chrome">│</span>
+<span class="chrome">│</span>  <span class="chrome">╰─────────────────────────────────────────────────────────────────╯</span>  <span class="chrome">│</span>
+<span class="chrome">╰─ <span class="dim">↑↓ select · Tab mode · Enter open · Ctrl+U clear · Esc quit</span> ─────────╯</span></pre>
+  </section>
+
+  <section id="features" class="features">
+    <h2 class="section-heading">Three things it does well</h2>
+    <div class="feature-grid">
+
+      <article class="feature">
+        <h3>Fast</h3>
+        <p>
+          A 65,536-column dense bigram inverted index turns each
+          query into a candidate bitset in microseconds. Verification
+          is exact: <code>memchr::memmem</code> for literal,
+          <code>regex</code> for regex, <code>neo_frizbee</code> for
+          fuzzy. P95 latency over 5,000 chunks: well under 50 ms.
+        </p>
+      </article>
+
+      <article class="feature">
+        <h3>Durable</h3>
+        <p>
+          Extracted text lives in SQLite (WAL, per-corpus DB under
+          your platform's data directory). Second startup re-uses the
+          extracted text — zero re-extraction unless a file's content
+          hash actually changed.
+        </p>
+      </article>
+
+      <article class="feature">
+        <h3>Live</h3>
+        <p>
+          A <code>notify-debouncer-full</code> watcher feeds an
+          arc-swapped overlay (tombstones + overflow chunks) sitting
+          on top of the base index. New, modified, or deleted PDFs
+          surface in search within ~200 ms — no rebuild, no blocking.
+        </p>
+      </article>
+
+    </div>
+  </section>
+
+  <section id="install" class="install">
+    <h2 class="section-heading">Install</h2>
+
+    <p class="prose">
+      One runtime dependency: Poppler's <code>pdftotext</code>.
+    </p>
+
+    <pre class="codeblock"><span class="comment"># Debian / Ubuntu</span>
+sudo apt-get install poppler-utils
+
+<span class="comment"># Fedora</span>
+sudo dnf install poppler-utils
+
+<span class="comment"># macOS</span>
+brew install poppler</pre>
+
+    <p class="prose">Then build from source (Rust 1.74+):</p>
+
+    <pre class="codeblock">git clone https://github.com/lambdabetaeta/pdffff
+cd pdffff
+cargo install --path .              <span class="comment"># TUI binary `pdffff`</span>
+cargo install --path . --features gui --bin pdffff-gui</pre>
+
+    <p class="footnote">
+      The GUI is optional — gated behind a Cargo feature so the
+      default build doesn't pull in <code>eframe</code> /
+      <code>winit</code>. The Win95-flavoured chrome works the same on
+      Linux, macOS and Windows.
+    </p>
+  </section>
+
+  <section id="use" class="use">
+    <h2 class="section-heading">Use</h2>
+
+    <pre class="codeblock">pdffff ~/papers           <span class="comment"># interactive TUI</span>
+pdffff-gui ~/papers       <span class="comment"># Win95-flavoured desktop window</span></pre>
+
+    <p class="prose">
+      The initial scan and per-PDF extraction run in the background —
+      results appear as soon as the first chunks land in the index,
+      and the status bar shows live progress. <kbd>Enter</kbd> opens
+      the highlighted PDF in your host's default viewer and keeps the
+      session open so you can pick more.
+    </p>
+
+    <div class="keys">
+      <dl>
+        <dt><kbd>Tab</kbd></dt>
+        <dd>cycle mode: literal → regex → fuzzy</dd>
+        <dt><kbd>↑</kbd> <kbd>↓</kbd></dt>
+        <dd>move selection (also <kbd>Ctrl+P</kbd> / <kbd>Ctrl+N</kbd>)</dd>
+        <dt><kbd>Enter</kbd></dt>
+        <dd>open the selected hit in your PDF viewer</dd>
+        <dt><kbd>Ctrl+U</kbd></dt>
+        <dd>clear the query (<kbd>Ctrl+W</kbd> erases by word)</dd>
+        <dt><kbd>Esc</kbd></dt>
+        <dd>quit (also <kbd>Ctrl+C</kbd> / <kbd>Ctrl+D</kbd> / <kbd>Ctrl+Q</kbd>)</dd>
+      </dl>
+    </div>
+
+    <div class="callout">
+      <h4>Selector mode for shell pipelines</h4>
+      <p>
+        Pass <code>--print-path</code> and <kbd>Enter</kbd> exits with
+        the chosen path on stdout instead of opening the file —
+        pdffff then composes like <code>fzf</code>:
+      </p>
+      <pre class="codeblock">cd "$(dirname "$(pdffff ~/papers --print-path)")"</pre>
+    </div>
+  </section>
+
+  <section id="how" class="how">
+    <h2 class="section-heading">How it works</h2>
+
+    <p class="prose">
+      <code>pdftotext - -</code> is invoked per PDF (PDF on stdin,
+      text on stdout — the shape <code>rga</code> uses). Output is
+      split on the form-feed (<code>\x0c</code>), normalized through
+      <code>deunicode</code> + lowercase + whitespace-collapse, and
+      sliced into 1,200-character chunks with 200-character overlap.
+      Chunks are persisted to SQLite.
+    </p>
+
+    <p class="prose">
+      On startup the chunk table is streamed into a flat vector plus
+      a 65,536-column dense bigram posting-list index (adapted from
+      <a href="https://github.com/dmtrKovalenko/fff">fff</a>'s
+      <code>bigram_filter</code>). Queries first ask the index for a
+      candidate bitset — for literal queries this is an AND of
+      consecutive and skip-1 bigrams; for regex an AND / OR tree
+      lifted from <code>regex-syntax</code>; for fuzzy an OR-of-AND of
+      evenly-spaced probe bigrams. Each candidate is then verified
+      exactly. Above the base index sits a small <em>overlay</em> of
+      tombstones and overflow chunks that absorbs file-system events
+      live; <code>arc-swap</code> rebuilds the base out of band when
+      the overlay crosses thresholds, with zero interruption to
+      queries.
+    </p>
+
+    <p class="footnote">
+      Full developer-facing layout in
+      <a href="https://github.com/lambdabetaeta/pdffff/blob/main/docs/architecture.md">docs/architecture.md</a>.
+    </p>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="footer-inner">
+    <p>
+      Released under the
+      <a href="https://github.com/lambdabetaeta/pdffff/blob/main/LICENSE">MIT License</a>.
+      Built on
+      <a href="https://github.com/dmtrKovalenko/fff">fff</a>'s bigram
+      index and the
+      <a href="https://github.com/phiresky/ripgrep-all">rga</a>-style
+      <code>pdftotext - -</code> pipeline.
+      <code>pdftotext</code> itself comes from
+      <a href="https://poppler.freedesktop.org/">Poppler</a> and is
+      invoked as a subprocess.
+    </p>
+    <p class="thin">
+      &copy; 2026 Alex Kavvos
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>

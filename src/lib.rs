@@ -6,9 +6,7 @@
 //! sits over the base index so a `notify-debouncer-full`-based watcher
 //! can reflect filesystem changes within ~200 ms without rebuilding.
 //!
-//! See [`deep-research-report.md`](../../../deep-research-report.md) in
-//! the repository root for the architectural rationale, and
-//! [`docs/architecture.md`](../../../docs/architecture.md) for the
+//! See [`docs/architecture.md`](../../../docs/architecture.md) for the
 //! developer-facing layout summary.
 //!
 //! The library is split along the boundaries described in those docs:
