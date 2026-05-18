@@ -69,14 +69,16 @@ use crate::query::{DISPLAY_LIMIT, Hit, QueryMode};
 use crate::ui::highlight::{SegmentKind, highlight_segments};
 use crate::ui::search::{SearchRequest, SearchWorker};
 
-// ─────────────────────── Win98/NT palette ───────────────────────────
+// ───────────────────────── Windows 95 palette ───────────────────────
 //
 // One hue, one job (same Bertin discipline as the TUI palette). The
-// 3D-button-face grey is the body of the world; navy blue is reserved
-// for chrome and focus; yellow-on-black is reserved exclusively for
-// query matches; red is reserved for errors.
+// 3D-button-face grey is the body of the world; the Plus!-pack title
+// gradient (navy → steel blue) is reserved for chrome and focus;
+// yellow-on-black is reserved exclusively for query matches; red is
+// reserved for errors. Soft drop shadows under raised tiles match
+// the period menu-shadow effect from Win95 OSR2 / Win98.
 
-/// Classic Windows 9x/NT "3D button face" — the body colour of every
+/// Classic Windows 9x "3D button face" — the body colour of every
 /// non-control surface.
 const FACE: Color32 = Color32::from_rgb(0xc0, 0xc0, 0xc0);
 /// Highlight edge of a raised bevel (top + left).
@@ -84,16 +86,61 @@ const BEVEL_LIGHT: Color32 = Color32::from_rgb(0xff, 0xff, 0xff);
 /// Shadow edge of a raised bevel (bottom + right). Inverted for sunken
 /// bevels (text inputs, the inset card body).
 const BEVEL_DARK: Color32 = Color32::from_rgb(0x80, 0x80, 0x80);
-/// Title bar / focus highlight. The Windows "Active Window" navy.
-const TITLE_BLUE: Color32 = Color32::from_rgb(0x00, 0x00, 0x80);
+/// Title bar gradient endpoints — the iconic Plus!-pack "active
+/// window" gradient (Win95 OSR2 onwards), running from the saturated
+/// navy on the left to a lighter steel blue on the right. Painting
+/// the title strip with these two endpoints recovers the warm "home
+/// PC" feel rather than the flat-navy enterprise NT4 look.
+const TITLE_BLUE_LEFT: Color32 = Color32::from_rgb(0x00, 0x00, 0x80);
+const TITLE_BLUE_RIGHT: Color32 = Color32::from_rgb(0x10, 0x84, 0xd0);
+/// Selection accent — keep the saturated navy; the gradient is
+/// reserved for the title strip so the selection cue stays distinct.
+const SELECT_NAVY: Color32 = TITLE_BLUE_LEFT;
 /// Hit highlight, identical role to the TUI's yellow-on-black.
 const MATCH_BG: Color32 = Color32::from_rgb(0xff, 0xff, 0x00);
 const MATCH_FG: Color32 = Color32::BLACK;
 /// Error pill background.
 const ERROR_BG: Color32 = Color32::from_rgb(0x80, 0x00, 0x00);
 
+/// Drop-shadow colour. Win95 menus used a hard offset shadow in
+/// `Color32::from_rgb(0x40, 0x40, 0x40)`; we lighten it slightly and
+/// stack a couple of translucent layers for a softer falloff — that
+/// modernises the shadow without leaving Win95 vocabulary (the
+/// "shadowed menu" was a recognised period UI effect).
+const SHADOW: Color32 = Color32::from_rgb(0x00, 0x00, 0x00);
+
 const SPINNER_FRAMES: [&str; 10] =
     ["|", "/", "-", "\\", "|", "/", "-", "\\", "*", "+"];
+
+// ────────────────────────── spacing / sizing ────────────────────────
+//
+// Bigger and airier than the bare Win98 dialog defaults — Win95
+// dialogs through the eyes of nostalgia, not as a corporate 1999
+// data-entry form.
+
+/// Outer margin inside the central panel.
+const PANEL_MARGIN: f32 = 12.0;
+/// Inset of card content from the card's bevel.
+const CARD_PAD_X: f32 = 12.0;
+const CARD_PAD_Y: f32 = 10.0;
+/// One result card's total height. Sized for the bumped 15pt body
+/// font + a 20px gap between the title row and the snippet row +
+/// `CARD_PAD_Y` top/bottom.
+const CARD_HEIGHT: f32 = 78.0;
+/// Vertical breathing space between adjacent cards.
+const CARD_GAP: f32 = 8.0;
+/// Title strip height (the navy gradient bar at the top).
+const TITLEBAR_HEIGHT: f32 = 30.0;
+/// Help strip height (the keybinding hints at the bottom).
+const HELPBAR_HEIGHT: f32 = 26.0;
+/// Body / button font size — the chunky end of "MS Sans Serif at
+/// 8pt", scaled up for legible nostalgia.
+const FONT_BODY: f32 = 15.0;
+/// Title-strip + heading font size.
+const FONT_HEADING: f32 = 16.0;
+/// Help-strip font size — slightly smaller than body so the strip
+/// reads as secondary chrome.
+const FONT_HELP: f32 = 13.0;
 
 /// Knobs for [`run_gui`]. Mirrors [`crate::tui::TuiOptions`] field-for-
 /// field so a launcher can pick either frontend without remapping.
@@ -126,8 +173,8 @@ pub fn run_gui(handle: WatchHandle, opts: GuiOptions) -> Result<Option<Hit>> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 640.0])
-            .with_min_inner_size([520.0, 320.0])
+            .with_inner_size([1020.0, 720.0])
+            .with_min_inner_size([620.0, 380.0])
             .with_title("pdffff"),
         ..Default::default()
     };
@@ -198,37 +245,96 @@ fn apply_win98_visuals(ctx: &egui::Context) {
     // not a colour shift.
 
     // Selection colour — the canonical Windows navy.
-    visuals.selection.bg_fill = TITLE_BLUE;
+    visuals.selection.bg_fill = SELECT_NAVY;
     visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
 
     ctx.set_visuals(visuals);
 
-    // Slightly tighter spacing than egui's defaults; Win9x dialogs are
-    // dense.
+    // Airy spacing — Win95 home-dialog generosity, not Win98
+    // enterprise density.
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = Vec2::new(6.0, 4.0);
-    style.spacing.button_padding = Vec2::new(8.0, 3.0);
-    style.spacing.interact_size = Vec2::new(24.0, 22.0);
-    // A single readable proportional font at a modest size — egui's
-    // default font (Ubuntu Light) at 13pt is the cleanest "MS Sans
-    // Serif-adjacent" we can ship without bundling a non-free font.
+    style.spacing.item_spacing = Vec2::new(10.0, 8.0);
+    style.spacing.button_padding = Vec2::new(12.0, 6.0);
+    style.spacing.interact_size = Vec2::new(28.0, 28.0);
+    // Chunky proportional body font. egui's stock Ubuntu Light at
+    // 15pt is the cleanest "MS Sans Serif-adjacent" we can ship
+    // without bundling a non-free bitmap font; the size is bumped from
+    // the period-correct 8pt for nostalgia-eye legibility rather than
+    // pixel-perfect emulation.
     style.text_styles.insert(
         TextStyle::Body,
-        FontId::new(13.0, FontFamily::Proportional),
+        FontId::new(FONT_BODY, FontFamily::Proportional),
     );
     style.text_styles.insert(
         TextStyle::Button,
-        FontId::new(13.0, FontFamily::Proportional),
+        FontId::new(FONT_BODY, FontFamily::Proportional),
     );
     style.text_styles.insert(
         TextStyle::Heading,
-        FontId::new(15.0, FontFamily::Proportional),
+        FontId::new(FONT_HEADING, FontFamily::Proportional),
     );
     style.text_styles.insert(
         TextStyle::Monospace,
-        FontId::new(12.0, FontFamily::Monospace),
+        FontId::new(FONT_BODY - 1.0, FontFamily::Monospace),
     );
     ctx.set_style(style);
+}
+
+/// Paint a horizontal gradient from `left` to `right` across `rect`.
+///
+/// Used for the Win95 Plus!-pack title strip (navy → steel blue).
+/// egui has no gradient brush primitive, so we approximate it with
+/// `rect.width()` 1px vertical strips and a channel-wise lerp; at
+/// title-bar sizes the cost is invisible.
+fn paint_horizontal_gradient(painter: &Painter, rect: Rect, left: Color32, right: Color32) {
+    let w = rect.width().max(1.0);
+    let steps = w.ceil() as i32;
+    for x in 0..steps {
+        let t = x as f32 / w;
+        let c = lerp_color(left, right, t);
+        let strip = Rect::from_min_max(
+            Pos2::new(rect.left() + x as f32, rect.top()),
+            Pos2::new(rect.left() + x as f32 + 1.0, rect.bottom()),
+        );
+        painter.rect_filled(strip, 0.0, c);
+    }
+}
+
+/// Channel-wise linear interpolation between two `Color32`s on the
+/// premultiplied-RGBA space egui stores natively.
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |x: u8, y: u8| -> u8 {
+        (x as f32 * (1.0 - t) + y as f32 * t).round().clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgba_premultiplied(
+        lerp(a.r(), b.r()),
+        lerp(a.g(), b.g()),
+        lerp(a.b(), b.b()),
+        lerp(a.a(), b.a()),
+    )
+}
+
+/// Paint a soft Win95-style drop shadow underneath `rect`.
+///
+/// Win95 menus / tooltips carried a hard black-grey shadow offset by
+/// a few pixels to the bottom-right; we use the same offset direction
+/// but stack three translucent layers so the falloff reads as soft
+/// rather than the harder dithered shadow of the period (egui
+/// renders straight 32-bit alpha, so the dither isn't an option;
+/// stacked translucent layers are the equivalent perceptual signal).
+///
+/// Must be called via the panel-level painter so the shadow can
+/// extend past `rect`'s own allocated footprint.
+fn paint_drop_shadow(painter: &Painter, rect: Rect) {
+    for step in 1..=3 {
+        let off = step as f32 * 1.5;
+        // Alpha decays roughly geometrically: 0x50 → 0x28 → 0x14.
+        let alpha = (0x50_u8) >> (step - 1) as u8;
+        let c = Color32::from_rgba_unmultiplied(SHADOW.r(), SHADOW.g(), SHADOW.b(), alpha);
+        let shadow_rect = rect.translate(Vec2::new(off, off));
+        painter.rect_filled(shadow_rect, 0.0, c);
+    }
 }
 
 /// Paint a 1px Win9x bevel on the outer perimeter of `rect`.
@@ -420,7 +526,11 @@ impl eframe::App for GuiApp {
         // The whole window is one panel; we paint our own bevels and
         // chrome inside it.
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(FACE).inner_margin(egui::Margin::same(8.0)))
+            .frame(
+                egui::Frame::none()
+                    .fill(FACE)
+                    .inner_margin(egui::Margin::same(PANEL_MARGIN)),
+            )
             .show(ctx, |ui| self.render(ui));
 
         // Keep the indexer-spinner moving and the live counters honest
@@ -508,41 +618,57 @@ fn word_erase(q: &mut String) {
 impl GuiApp {
     fn render(&mut self, ui: &mut Ui) {
         self.render_titlebar(ui);
-        ui.add_space(6.0);
+        ui.add_space(10.0);
         self.render_input(ui);
-        ui.add_space(4.0);
+        ui.add_space(8.0);
         self.render_separator_or_error(ui);
-        ui.add_space(6.0);
+        ui.add_space(10.0);
         self.render_results(ui);
         self.render_help_bar(ui);
     }
 
-    /// Faux Win9x title strip — rendered inside the client area so the
+    /// Faux Win95 title strip — rendered inside the client area so the
     /// system window decorations stay clickable but the *content*
-    /// announces the look. Carries the brand pill, the watched root,
-    /// and the live indexer counters.
+    /// announces the look. Plus!-pack gradient (navy → steel blue)
+    /// carries the brand pill on the left and the live indexer
+    /// counters on the right, with a soft drop shadow underneath so
+    /// the strip floats over the panel body.
     fn render_titlebar(&self, ui: &mut Ui) {
         let snap = snapshot_progress(&self.progress);
-        let height = 22.0;
         let (rect, _) = ui.allocate_exact_size(
-            Vec2::new(ui.available_width(), height),
+            Vec2::new(ui.available_width(), TITLEBAR_HEIGHT),
             Sense::hover(),
         );
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, TITLE_BLUE);
+        // Shadow first, on the panel-level painter so it can spill
+        // outside `rect`.
+        paint_drop_shadow(ui.painter(), rect);
 
-        // Left: "pdffff <root>".
-        let brand = format!("  pdffff  ");
-        let body_font = FontId::new(13.0, FontFamily::Proportional);
-        let brand_galley = painter.layout_no_wrap(brand, body_font.clone(), Color32::WHITE);
-        let brand_pos = Pos2::new(rect.left() + 4.0, rect.center().y - brand_galley.size().y / 2.0);
+        let painter = ui.painter_at(rect);
+        paint_horizontal_gradient(&painter, rect, TITLE_BLUE_LEFT, TITLE_BLUE_RIGHT);
+        // 1px bevel around the strip so it reads as a chrome element
+        // rather than an arbitrary gradient band.
+        paint_bevel(&painter, rect, true);
+
+        let heading_font = FontId::new(FONT_HEADING, FontFamily::Proportional);
+
+        // Left: "pdffff <root>". Brand bolded by overpainting at +1px.
+        let brand = "  pdffff  ".to_string();
+        let brand_galley =
+            painter.layout_no_wrap(brand.clone(), heading_font.clone(), Color32::WHITE);
+        let brand_pos = Pos2::new(
+            rect.left() + 6.0,
+            rect.center().y - brand_galley.size().y / 2.0,
+        );
         painter.galley(brand_pos, brand_galley.clone(), Color32::WHITE);
+        let brand_bold =
+            painter.layout_no_wrap(brand, heading_font.clone(), Color32::WHITE);
+        painter.galley(brand_pos + Vec2::new(1.0, 0.0), brand_bold, Color32::WHITE);
 
         let root_text = format!("{}", self.opts.root.display());
         let root_galley =
-            painter.layout_no_wrap(root_text, body_font.clone(), Color32::WHITE);
+            painter.layout_no_wrap(root_text, heading_font.clone(), Color32::WHITE);
         let root_pos = Pos2::new(
-            brand_pos.x + brand_galley.size().x + 4.0,
+            brand_pos.x + brand_galley.size().x + 6.0,
             rect.center().y - root_galley.size().y / 2.0,
         );
         painter.galley(root_pos, root_galley, Color32::WHITE);
@@ -560,38 +686,36 @@ impl GuiApp {
             snap.ok, snap.empty, snap.error, snap.deleted, activity,
         );
         let counters_galley =
-            painter.layout_no_wrap(counters, body_font, Color32::WHITE);
+            painter.layout_no_wrap(counters, heading_font, Color32::WHITE);
         let counters_pos = Pos2::new(
-            rect.right() - counters_galley.size().x - 4.0,
+            rect.right() - counters_galley.size().x - 6.0,
             rect.center().y - counters_galley.size().y / 2.0,
         );
         painter.galley(counters_pos, counters_galley, Color32::WHITE);
     }
 
-    /// Query input + mode pill. The input is a sunken text well with a
-    /// "❯" prompt; the mode pill is a raised button that cycles the
-    /// mode on click.
+    /// Query input + mode pill. The input is a sunken white text well
+    /// with a "❯" prompt; the mode pill is a raised button that
+    /// cycles the mode on click, with its own tiny drop shadow.
     fn render_input(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("❯").color(Color32::BLACK).strong());
+            ui.label(
+                RichText::new("❯")
+                    .color(Color32::BLACK)
+                    .size(FONT_BODY + 1.0)
+                    .strong(),
+            );
 
             let edit = TextEdit::singleline(&mut self.query)
-                .desired_width(ui.available_width() - 80.0)
+                .desired_width(ui.available_width() - 100.0)
                 .frame(false)
                 .text_color(Color32::BLACK)
-                .margin(Vec2::new(4.0, 3.0));
-            let edit_rect_before = ui.available_rect_before_wrap();
+                .font(FontId::new(FONT_BODY, FontFamily::Proportional))
+                .margin(Vec2::new(8.0, 6.0));
             let resp = ui.add(edit);
-            // Paint the sunken well behind the text.
-            let well = resp.rect.expand2(Vec2::new(0.0, 0.0));
-            // We need to draw the bevel *behind* the text — easiest is
-            // to use the painter on a layer below. Since egui paints
-            // bottom-up in order of widget addition, the bevel painted
-            // here lands on top. To avoid that, paint a filled white
-            // rect *and* the bevel *before* the TextEdit by allocating
-            // the area first; but that requires a layout dance. The
-            // simpler, cheap-to-reason about path: paint the well via
-            // an early-layer painter that targets the same rect.
+            // Paint the sunken well behind the text on the background
+            // layer.
+            let well = resp.rect;
             let painter = ui.ctx().layer_painter(egui::LayerId::background());
             painter.rect_filled(well, 0.0, Color32::WHITE);
             paint_bevel(&painter, well, false);
@@ -599,32 +723,27 @@ impl GuiApp {
             if resp.changed() {
                 self.submit_query();
             }
-            // Grab focus exactly once at startup so the user can begin
-            // typing without first clicking the input. After that, the
-            // user owns focus — we don't steal it back on every
-            // repaint.
             if !self.did_initial_focus {
                 resp.request_focus();
                 self.did_initial_focus = true;
             }
-            // Keep the rect-before-wrap usable downstream.
-            let _ = edit_rect_before;
 
-            ui.add_space(8.0);
-            // Mode pill — raised button look.
+            ui.add_space(12.0);
+            // Mode pill — raised button look with a small drop shadow.
             let label = match self.mode {
                 QueryMode::Literal => " LIT ",
                 QueryMode::Regex => " RE ",
                 QueryMode::Fuzzy => " FZ ",
             };
             let (pill_rect, pill_resp) = ui.allocate_exact_size(
-                Vec2::new(46.0, 22.0),
+                Vec2::new(62.0, 30.0),
                 Sense::click(),
             );
+            paint_drop_shadow(ui.painter(), pill_rect);
             let pp = ui.painter_at(pill_rect);
             pp.rect_filled(pill_rect, 0.0, FACE);
             paint_bevel(&pp, pill_rect, !pill_resp.is_pointer_button_down_on());
-            let body_font = FontId::new(13.0, FontFamily::Proportional);
+            let body_font = FontId::new(FONT_BODY, FontFamily::Proportional);
             let galley = pp.layout_no_wrap(label.to_string(), body_font, Color32::BLACK);
             let p = Pos2::new(
                 pill_rect.center().x - galley.size().x / 2.0,
@@ -640,15 +759,18 @@ impl GuiApp {
     fn render_separator_or_error(&self, ui: &mut Ui) {
         if let Some(err) = &self.last_error {
             ui.horizontal(|ui| {
-                // Red "error" pill.
+                // Red "error" pill with its own small shadow so it
+                // reads as a raised badge.
                 let label_text = " error ";
-                let body_font = FontId::new(13.0, FontFamily::Proportional);
+                let body_font = FontId::new(FONT_BODY, FontFamily::Proportional);
                 let (label_rect, _) = ui.allocate_exact_size(
-                    Vec2::new(56.0, 20.0),
+                    Vec2::new(68.0, 26.0),
                     Sense::hover(),
                 );
+                paint_drop_shadow(ui.painter(), label_rect);
                 let painter = ui.painter_at(label_rect);
                 painter.rect_filled(label_rect, 0.0, ERROR_BG);
+                paint_bevel(&painter, label_rect, true);
                 let galley = painter.layout_no_wrap(
                     label_text.to_string(),
                     body_font,
@@ -659,12 +781,13 @@ impl GuiApp {
                     label_rect.center().y - galley.size().y / 2.0,
                 );
                 painter.galley(p, galley, Color32::WHITE);
-                ui.add_space(4.0);
-                ui.label(RichText::new(err).color(ERROR_BG));
+                ui.add_space(8.0);
+                ui.label(RichText::new(err).color(ERROR_BG).size(FONT_BODY));
             });
         } else {
-            // Thin grey horizontal rule, drawn as two adjacent 1px
-            // lines to mirror the Win9x "etched groupbox" separator.
+            // Etched groupbox-style separator: dark line over light
+            // line. Same Win9x vocabulary as a `<HR>` between
+            // dialog regions.
             let (rect, _) = ui.allocate_exact_size(
                 Vec2::new(ui.available_width(), 2.0),
                 Sense::hover(),
@@ -693,8 +816,13 @@ impl GuiApp {
                 "no hits"
             };
             ui.vertical_centered(|ui| {
-                ui.add_space(20.0);
-                ui.label(RichText::new(msg).italics().color(BEVEL_DARK));
+                ui.add_space(28.0);
+                ui.label(
+                    RichText::new(msg)
+                        .italics()
+                        .color(BEVEL_DARK)
+                        .size(FONT_BODY),
+                );
             });
             self.prev_selected = self.selected;
             return;
@@ -712,10 +840,10 @@ impl GuiApp {
         // The result list is scrollable. We reserve room at the bottom
         // for the help bar (which is rendered *after* the results, so
         // its height is taken from the layout cursor).
-        let available_h = ui.available_height() - 28.0;
+        let available_h = ui.available_height() - (HELPBAR_HEIGHT + 8.0);
         let mut activated: Option<usize> = None;
         egui::ScrollArea::vertical()
-            .max_height(available_h.max(60.0))
+            .max_height(available_h.max(CARD_HEIGHT))
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 for i in 0..total {
@@ -728,7 +856,7 @@ impl GuiApp {
                     if scroll_target == Some(i) {
                         resp.scroll_to_me(Some(egui::Align::Center));
                     }
-                    ui.add_space(4.0);
+                    ui.add_space(CARD_GAP);
                 }
             });
         if let Some(i) = activated {
@@ -739,9 +867,9 @@ impl GuiApp {
     }
 
     fn render_help_bar(&self, ui: &mut Ui) {
-        ui.add_space(4.0);
+        ui.add_space(8.0);
         let (rect, _) = ui.allocate_exact_size(
-            Vec2::new(ui.available_width(), 20.0),
+            Vec2::new(ui.available_width(), HELPBAR_HEIGHT),
             Sense::hover(),
         );
         let painter = ui.painter_at(rect);
@@ -759,22 +887,20 @@ impl GuiApp {
         );
         let help =
             "↑↓ select   Tab mode   Enter open   Ctrl+U clear   Ctrl+W word-erase   Esc quit";
-        let font = FontId::new(12.0, FontFamily::Proportional);
+        let font = FontId::new(FONT_HELP, FontFamily::Proportional);
         let galley =
             painter.layout_no_wrap(help.to_string(), font, BEVEL_DARK);
         let p = Pos2::new(
-            rect.left() + 4.0,
-            rect.center().y - galley.size().y / 2.0 + 1.0,
+            rect.left() + 6.0,
+            rect.center().y - galley.size().y / 2.0 + 2.0,
         );
         painter.galley(p, galley, BEVEL_DARK);
     }
 }
 
 /// One result card. Returns the click response so the caller can pick
-/// it. The card is a raised bevelled tile when unselected; the
-/// selected card replaces the top edge with a navy bar to mirror the
-/// TUI's magenta-bordered selection while keeping the surrounding
-/// chrome consistent.
+/// it. The card is a raised bevelled tile with a soft drop shadow
+/// underneath; selected cards add a navy strip along the top edge.
 fn render_hit_card(
     ui: &mut Ui,
     i: usize,
@@ -793,12 +919,15 @@ fn render_hit_card(
         }
     };
 
-    let body_font = FontId::new(13.0, FontFamily::Proportional);
+    let body_font = FontId::new(FONT_BODY, FontFamily::Proportional);
 
-    // Reserve space: title row (20px) + snippet row (40px wrapping) +
-    // 8px padding top/bottom + 1px bevel.
-    let desired = Vec2::new(ui.available_width(), 64.0);
+    let desired = Vec2::new(ui.available_width(), CARD_HEIGHT);
     let (rect, resp) = ui.allocate_exact_size(desired, Sense::click());
+
+    // Drop shadow first, on the panel-level painter so it can spill
+    // past `rect`'s allocated footprint.
+    paint_drop_shadow(ui.painter(), rect);
+
     let painter = ui.painter_at(rect);
 
     // Card body — raised tile.
@@ -806,25 +935,25 @@ fn render_hit_card(
     paint_bevel(&painter, rect, true);
 
     // Selection accent: a 3px navy strip along the top, inside the
-    // bevel. Matches the TUI's "border-only" selection cue while
-    // playing nice with the Win9x palette.
+    // bevel. Mirrors the TUI's border-only selection cue using the
+    // Win95 active-title navy.
     if selected {
         let accent = Rect::from_min_max(
             Pos2::new(rect.left() + 1.0, rect.top() + 1.0),
             Pos2::new(rect.right() - 1.0, rect.top() + 4.0),
         );
-        painter.rect_filled(accent, 0.0, TITLE_BLUE);
+        painter.rect_filled(accent, 0.0, SELECT_NAVY);
     }
 
-    let inner = rect.shrink2(Vec2::new(8.0, 6.0));
+    let inner = rect.shrink2(Vec2::new(CARD_PAD_X, CARD_PAD_Y));
 
     // Title row: "1. filename" left-aligned, meta right-aligned.
     let title_y = inner.top();
     let prefix = format!("{}. ", i + 1);
     let prefix_galley =
-        painter.layout_no_wrap(prefix.clone(), body_font.clone(), Color32::BLACK);
+        painter.layout_no_wrap(prefix.clone(), body_font.clone(), BEVEL_DARK);
     let prefix_pos = Pos2::new(inner.left(), title_y);
-    painter.galley(prefix_pos, prefix_galley.clone(), Color32::BLACK);
+    painter.galley(prefix_pos, prefix_galley.clone(), BEVEL_DARK);
 
     paint_highlighted(
         &painter,
@@ -841,8 +970,25 @@ fn render_hit_card(
     let meta_pos = Pos2::new(inner.right() - meta_galley.size().x, title_y);
     painter.galley(meta_pos, meta_galley, BEVEL_DARK);
 
-    // Snippet row, wrapped to inner width.
-    let snippet_origin = Pos2::new(inner.left(), title_y + 20.0);
+    // Hairline separating the title row from the snippet — etched
+    // groupbox-style, dark over light, for a touch of "real Win95
+    // dialog" structure inside the card.
+    let title_h = body_font.size + 4.0;
+    let rule_y = title_y + title_h;
+    painter.line_segment(
+        [Pos2::new(inner.left(), rule_y), Pos2::new(inner.right(), rule_y)],
+        Stroke::new(1.0, BEVEL_DARK),
+    );
+    painter.line_segment(
+        [
+            Pos2::new(inner.left(), rule_y + 1.0),
+            Pos2::new(inner.right(), rule_y + 1.0),
+        ],
+        Stroke::new(1.0, BEVEL_LIGHT),
+    );
+
+    // Snippet row, below the hairline.
+    let snippet_origin = Pos2::new(inner.left(), rule_y + 6.0);
     paint_highlighted(
         &painter,
         snippet_origin,
