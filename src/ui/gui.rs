@@ -133,6 +133,10 @@ const CARD_GAP: f32 = 8.0;
 const TITLEBAR_HEIGHT: f32 = 30.0;
 /// Help strip height (the keybinding hints at the bottom).
 const HELPBAR_HEIGHT: f32 = 26.0;
+/// Mode-pill width — sized for the longest label ("LITERAL") plus
+/// padding so all three states (LITERAL / REGEX / FUZZY) fit the
+/// same pill without resizing as the mode cycles.
+const MODE_PILL_W: f32 = 112.0;
 /// Body / button font size — the chunky end of "MS Sans Serif at
 /// 8pt", scaled up for legible nostalgia.
 const FONT_BODY: f32 = 15.0;
@@ -697,6 +701,17 @@ impl GuiApp {
     /// Query input + mode pill. The input is a sunken white text well
     /// with a "❯" prompt; the mode pill is a raised button that
     /// cycles the mode on click, with its own tiny drop shadow.
+    ///
+    /// The white well is painted via `egui::Frame::fill`, *not* via a
+    /// separate `layer_painter` call: `CentralPanel` and our paints
+    /// both live on `LayerId::background()`, and within a single
+    /// egui layer draw commands run in insertion order — a rect
+    /// queued after the TextEdit would cover its text. Routing the
+    /// fill through a Frame means the white lands at the right point
+    /// in the widget pass (under the text). The 1px bevel is painted
+    /// *after* `Frame::show` returns, on top of everything; that's
+    /// fine because the bevel only touches the outer-edge pixels and
+    /// never overlaps the text.
     fn render_input(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.label(
@@ -706,19 +721,28 @@ impl GuiApp {
                     .strong(),
             );
 
-            let edit = TextEdit::singleline(&mut self.query)
-                .desired_width(ui.available_width() - 100.0)
-                .frame(false)
-                .text_color(Color32::BLACK)
-                .font(FontId::new(FONT_BODY, FontFamily::Proportional))
-                .margin(Vec2::new(8.0, 6.0));
-            let resp = ui.add(edit);
-            // Paint the sunken well behind the text on the background
-            // layer.
-            let well = resp.rect;
-            let painter = ui.ctx().layer_painter(egui::LayerId::background());
-            painter.rect_filled(well, 0.0, Color32::WHITE);
-            paint_bevel(&painter, well, false);
+            let pill_w = MODE_PILL_W;
+            let well_target_w = ui.available_width() - pill_w - 12.0;
+            let inner = egui::Frame::none()
+                .fill(Color32::WHITE)
+                .inner_margin(egui::Margin {
+                    left: 10.0,
+                    right: 10.0,
+                    top: 6.0,
+                    bottom: 6.0,
+                })
+                .show(ui, |ui| {
+                    ui.add(
+                        TextEdit::singleline(&mut self.query)
+                            .desired_width(well_target_w - 20.0)
+                            .frame(false)
+                            .text_color(Color32::BLACK)
+                            .font(FontId::new(FONT_BODY, FontFamily::Proportional)),
+                    )
+                });
+            let well_rect = inner.response.rect;
+            paint_bevel(&ui.painter_at(well_rect), well_rect, false);
+            let resp = inner.inner;
 
             if resp.changed() {
                 self.submit_query();
@@ -731,12 +755,12 @@ impl GuiApp {
             ui.add_space(12.0);
             // Mode pill — raised button look with a small drop shadow.
             let label = match self.mode {
-                QueryMode::Literal => " LIT ",
-                QueryMode::Regex => " RE ",
-                QueryMode::Fuzzy => " FZ ",
+                QueryMode::Literal => " LITERAL ",
+                QueryMode::Regex => " REGEX ",
+                QueryMode::Fuzzy => " FUZZY ",
             };
             let (pill_rect, pill_resp) = ui.allocate_exact_size(
-                Vec2::new(62.0, 30.0),
+                Vec2::new(pill_w, 30.0),
                 Sense::click(),
             );
             paint_drop_shadow(ui.painter(), pill_rect);
