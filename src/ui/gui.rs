@@ -1,29 +1,26 @@
-//! Win98/NT-flavoured cross-platform desktop GUI for `pdffff`.
+//! Vapourwave-flavoured cross-platform desktop GUI for `pdffff`.
 //!
-//! The GUI mirrors the TUI feature-for-feature:
+//! Same skeleton as a Win9x dialog (1px bevels, square corners, a
+//! status strip up top, a help strip at the bottom, raised cards in
+//! the middle) but recoloured in the canonical late-Tumblr palette:
+//! deep violet body, hot-pink + neon-cyan edges, peachy cream text,
+//! drop shadows under every card. The TUI's Bertin-style discipline
+//! survives the recolour — one hue, one job:
 //!
-//! ```text
-//!  ╔════════════════════════════════════════════════════════════════════╗
-//!  ║ pdffff  /Users/foo/papers                          12 ok · ⠿ idx 3 ║
-//!  ╟────────────────────────────────────────────────────────────────────╢
-//!  ║  ❯ [ alpha synthesis▏          ]                            [ FZ ] ║
-//!  ║  ─────────────────────────────────────────────────────────────────  ║
-//!  ║  ┌ 1. paper.pdf ─────────────────────────────────── p.12 · #3 ───┐ ║
-//!  ║  │ …matching snippet with [highlighted] terms…                   │ ║
-//!  ║  └───────────────────────────────────────────────────────────────┘ ║
-//!  ║                                                                    ║
-//!  ║  ┌ 2. other.pdf ────────────────────── p. 1 · #0 · score 1247 ──┐ ║
-//!  ║  │ …another snippet…                                             │ ║
-//!  ║  └───────────────────────────────────────────────────────────────┘ ║
-//!  ╟────────────────────────────────────────────────────────────────────╢
-//!  ║ ↑↓ select   Tab mode   Enter open   Ctrl+U clear   Esc quit        ║
-//!  ╚════════════════════════════════════════════════════════════════════╝
-//! ```
+//! * **pink** is chrome (bevel highlight, mode pill, prompt)
+//! * **cyan** is focus (selection accent, gradient end-stop, hovered
+//!   stroke)
+//! * **violet** is body (panels, card bodies, input wells)
+//! * **yellow-on-magenta** is reserved exclusively for query matches
+//!   (CRT-style hot-pop)
+//! * **bright pink** is error
 //!
-//! The faux 3D bevels (light-top/left, dark-bottom/right for raised
-//! surfaces, inverted for sunken ones) are painted via the egui
-//! `Painter` API; egui's default rounded `Frame` chrome is suppressed
-//! globally in [`apply_win98_visuals`].
+//! The faux 3D bevels are still painted via the egui `Painter` API;
+//! egui's default rounded `Frame` chrome is still suppressed globally
+//! in [`apply_vapourwave_visuals`]. Drop shadows under each card are
+//! painted as a stack of translucent pink/cyan rects (egui has no
+//! gaussian blur, so the soft-glow look is approximated by a few
+//! offset layers with decaying alpha).
 //!
 //! Shared kernel
 //! -------------
@@ -69,31 +66,53 @@ use crate::query::{DISPLAY_LIMIT, Hit, QueryMode};
 use crate::ui::highlight::{SegmentKind, highlight_segments};
 use crate::ui::search::{SearchRequest, SearchWorker};
 
-// ─────────────────────── Win98/NT palette ───────────────────────────
+// ─────────────────────── vapourwave palette ─────────────────────────
 //
-// One hue, one job (same Bertin discipline as the TUI palette). The
-// 3D-button-face grey is the body of the world; navy blue is reserved
-// for chrome and focus; yellow-on-black is reserved exclusively for
-// query matches; red is reserved for errors.
+// One hue, one job (Bertin discipline preserved from the TUI). Deep
+// violet body, hot-pink chrome, neon-cyan focus, yellow-on-magenta
+// reserved exclusively for query matches, peachy cream for body text.
 
-/// Classic Windows 9x/NT "3D button face" — the body colour of every
-/// non-control surface.
-const FACE: Color32 = Color32::from_rgb(0xc0, 0xc0, 0xc0);
-/// Highlight edge of a raised bevel (top + left).
-const BEVEL_LIGHT: Color32 = Color32::from_rgb(0xff, 0xff, 0xff);
-/// Shadow edge of a raised bevel (bottom + right). Inverted for sunken
-/// bevels (text inputs, the inset card body).
-const BEVEL_DARK: Color32 = Color32::from_rgb(0x80, 0x80, 0x80);
-/// Title bar / focus highlight. The Windows "Active Window" navy.
-const TITLE_BLUE: Color32 = Color32::from_rgb(0x00, 0x00, 0x80);
-/// Hit highlight, identical role to the TUI's yellow-on-black.
-const MATCH_BG: Color32 = Color32::from_rgb(0xff, 0xff, 0x00);
-const MATCH_FG: Color32 = Color32::BLACK;
-/// Error pill background.
-const ERROR_BG: Color32 = Color32::from_rgb(0x80, 0x00, 0x00);
+/// Window background — deep midnight violet, just enough purple to
+/// register as not-black.
+const BG_DEEP: Color32 = Color32::from_rgb(0x0d, 0x05, 0x1f);
+/// Panel / card body — one step up from `BG_DEEP`, the canonical
+/// "face" colour every raised surface fills with.
+const FACE: Color32 = Color32::from_rgb(0x2a, 0x10, 0x4a);
+/// One more step up — used for the input well (sunken text input) so
+/// the well reads as a recess rather than another raised panel.
+const WELL_FILL: Color32 = Color32::from_rgb(0x1a, 0x08, 0x33);
+/// Highlight edge of a raised bevel (top + left). Hot pink — the
+/// signature vapourwave neon.
+const BEVEL_LIGHT: Color32 = Color32::from_rgb(0xff, 0x71, 0xce);
+/// Shadow edge of a raised bevel (bottom + right). Cool, deep violet
+/// so the bevel reads as light-from-the-northwest the same way Win9x
+/// does, but the colour speaks the vapourwave dialect.
+const BEVEL_DARK: Color32 = Color32::from_rgb(0x5a, 0x18, 0x8a);
+/// Focus accent / selection — the cooler half of the palette so it
+/// pops against the pink chrome.
+const ACCENT_CYAN: Color32 = Color32::from_rgb(0x01, 0xcd, 0xfe);
+/// Gradient endpoint paired with `ACCENT_CYAN` across the title strip.
+const ACCENT_MAGENTA: Color32 = Color32::from_rgb(0xff, 0x36, 0x9f);
+/// Body text — cream so it has warmth on the violet body without
+/// glaring like pure white.
+const TEXT_LIGHT: Color32 = Color32::from_rgb(0xff, 0xf3, 0xe0);
+/// Secondary / dim text — peachy pink, half the saturation of the
+/// neon edges so meta strings recede from the title.
+const TEXT_DIM: Color32 = Color32::from_rgb(0xd6, 0xa3, 0xd9);
+/// Hit highlight — bright yellow on hot magenta, the CRT-pop the TUI
+/// achieves with yellow-on-black. Reserved exclusively for matches.
+const MATCH_BG: Color32 = Color32::from_rgb(0xff, 0x2d, 0x95);
+const MATCH_FG: Color32 = Color32::from_rgb(0xff, 0xfb, 0x96);
+/// Error pill — a brighter pink than the chrome so it doesn't fight
+/// the magenta match highlight.
+const ERROR_BG: Color32 = Color32::from_rgb(0xff, 0x4f, 0x5e);
+/// Translucent pink used to fake a soft drop-shadow under each card.
+/// Stacked at decaying alpha for a glow-like falloff (egui has no
+/// gaussian blur primitive, so this is the cheapest fake).
+const SHADOW_PINK: Color32 = Color32::from_rgba_premultiplied(0x40, 0x10, 0x30, 0x40);
 
 const SPINNER_FRAMES: [&str; 10] =
-    ["|", "/", "-", "\\", "|", "/", "-", "\\", "*", "+"];
+    ["◜", "◝", "◞", "◟", "◜", "◝", "◞", "◟", "✦", "✧"];
 
 /// Knobs for [`run_gui`]. Mirrors [`crate::tui::TuiOptions`] field-for-
 /// field so a launcher can pick either frontend without remapping.
@@ -137,7 +156,7 @@ pub fn run_gui(handle: WatchHandle, opts: GuiOptions) -> Result<Option<Hit>> {
         "pdffff",
         native_options,
         Box::new(move |cc| {
-            apply_win98_visuals(&cc.egui_ctx);
+            apply_vapourwave_visuals(&cc.egui_ctx);
             let app = GuiApp::new(handle, opts_for_app, chosen_for_app, cc.egui_ctx.clone())?;
             Ok(Box::new(app))
         }),
@@ -150,34 +169,35 @@ pub fn run_gui(handle: WatchHandle, opts: GuiOptions) -> Result<Option<Hit>> {
 
 // ─────────────────────────── styling ────────────────────────────────
 
-/// Stamp every egui surface with the Win98/NT look. Called once at
+/// Stamp every egui surface with the vapourwave look. Called once at
 /// `CreationContext`; `set_visuals` / `set_style` apply globally for
 /// the life of the window.
 ///
-/// Win9x had sharp 1px corners on every chrome element, so every
-/// rounding parameter goes to zero. egui's stock palette assumes a
-/// modern flat-grey-on-grey aesthetic, so we replace each role colour
-/// rather than tweaking; that way no remaining widget falls back to a
-/// stock blue/grey that breaks the period look.
-fn apply_win98_visuals(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::light();
+/// The Win9x bones are preserved (square 1px corners everywhere; no
+/// egui-default rounded chrome) — only the palette is replaced. We
+/// rewrite each widget-state role explicitly so no fallback grey-on-
+/// grey survives anywhere.
+fn apply_vapourwave_visuals(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
 
-    // Panel + window body — the canonical 3D button face.
-    visuals.window_fill = FACE;
-    visuals.panel_fill = FACE;
+    // Outer window + inner panels use the deep-midnight backdrop; the
+    // raised "face" colour is reserved for cards / the mode pill so
+    // raised vs body chrome is itself a visual variable.
+    visuals.window_fill = BG_DEEP;
+    visuals.panel_fill = BG_DEEP;
     visuals.faint_bg_color = FACE;
-    // Inset (sunken) areas use white for the input wells.
-    visuals.extreme_bg_color = Color32::WHITE;
+    // Sunken text wells — the input box reads as a recess in the
+    // panel rather than a separate raised tile.
+    visuals.extreme_bg_color = WELL_FILL;
 
-    // Kill all rounding — Win9x is square.
+    // Kill all rounding — square corners everywhere.
     let zero = egui::Rounding::ZERO;
     visuals.window_rounding = zero;
     visuals.menu_rounding = zero;
     visuals.window_shadow = egui::epaint::Shadow::NONE;
     visuals.popup_shadow = egui::epaint::Shadow::NONE;
 
-    // Text colour everywhere — pure black on grey, pure black on white.
-    let black_fg = Stroke::new(1.0, Color32::BLACK);
+    let body_fg = Stroke::new(1.0, TEXT_LIGHT);
     let no_stroke = Stroke::NONE;
 
     for w in [
@@ -191,15 +211,22 @@ fn apply_win98_visuals(ctx: &egui::Context) {
         w.bg_fill = FACE;
         w.weak_bg_fill = FACE;
         w.bg_stroke = no_stroke;
-        w.fg_stroke = black_fg;
+        w.fg_stroke = body_fg;
         w.expansion = 0.0;
     }
-    // Hovered/active keep the same grey body — the bevel does the work,
-    // not a colour shift.
+    // A subtle hover-glow: the hovered/active states keep the face
+    // colour but pick up a thin cyan outline. The card painter
+    // currently doesn't use this (it draws its own bevel), but stock
+    // egui widgets like the scrollbar handle benefit.
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT_CYAN);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT_CYAN);
 
-    // Selection colour — the canonical Windows navy.
-    visuals.selection.bg_fill = TITLE_BLUE;
-    visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    // Selection — the cool half of the palette.
+    visuals.selection.bg_fill = ACCENT_CYAN;
+    visuals.selection.stroke = Stroke::new(1.0, BG_DEEP);
+
+    // Hyperlinks (egui paints one in `code` blocks etc) — keep on-brand.
+    visuals.hyperlink_color = ACCENT_CYAN;
 
     ctx.set_visuals(visuals);
 
@@ -231,11 +258,52 @@ fn apply_win98_visuals(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-/// Paint a 1px Win9x bevel on the outer perimeter of `rect`.
+/// Paint a horizontal gradient from `left` to `right` across `rect`.
 ///
-/// `raised = true` paints buttons / toolbars (light top-left, dark
-/// bottom-right); `raised = false` paints text inputs and the inset
-/// card body (dark top-left, light bottom-right).
+/// egui's primitive set has no native gradient brush; we approximate
+/// one by painting `rect.width()` 1px vertical strips with the
+/// channel-wise linear interpolation between `left` and `right`. At
+/// typical title-bar / horizon-rule sizes (a few hundred pixels) the
+/// cost is invisible — it's still O(width) draw calls but each one
+/// is a tiny filled rectangle.
+fn paint_horizontal_gradient(painter: &Painter, rect: Rect, left: Color32, right: Color32) {
+    let w = rect.width().max(1.0);
+    let steps = w.ceil() as i32;
+    for x in 0..steps {
+        let t = x as f32 / w;
+        let c = lerp_color(left, right, t);
+        let strip = Rect::from_min_max(
+            Pos2::new(rect.left() + x as f32, rect.top()),
+            Pos2::new(rect.left() + x as f32 + 1.0, rect.bottom()),
+        );
+        painter.rect_filled(strip, 0.0, c);
+    }
+}
+
+/// Channel-wise linear interpolation between two `Color32`s. Operates
+/// on premultiplied RGBA, which is what egui stores internally; the
+/// alpha channel travels with the colour so a translucent endpoint
+/// fades into a translucent midpoint as expected.
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |x: u8, y: u8| -> u8 {
+        (x as f32 * (1.0 - t) + y as f32 * t).round().clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgba_premultiplied(
+        lerp(a.r(), b.r()),
+        lerp(a.g(), b.g()),
+        lerp(a.b(), b.b()),
+        lerp(a.a(), b.a()),
+    )
+}
+
+/// Paint a 1px bevel on the outer perimeter of `rect`.
+///
+/// `raised = true` paints buttons / cards (light top-left, dark
+/// bottom-right); `raised = false` paints text inputs and inset
+/// surfaces (dark top-left, light bottom-right). "Light" and "dark"
+/// here are the vapourwave hot-pink / deep-violet bevel pair, not
+/// literal grey-on-grey.
 fn paint_bevel(painter: &Painter, rect: Rect, raised: bool) {
     let (light, dark) = if raised {
         (BEVEL_LIGHT, BEVEL_DARK)
@@ -418,9 +486,15 @@ impl eframe::App for GuiApp {
         self.drain_results();
 
         // The whole window is one panel; we paint our own bevels and
-        // chrome inside it.
+        // chrome inside it. The panel fill is the deep-violet body
+        // colour so cards (the raised `FACE` colour) read as floating
+        // above it.
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(FACE).inner_margin(egui::Margin::same(8.0)))
+            .frame(
+                egui::Frame::none()
+                    .fill(BG_DEEP)
+                    .inner_margin(egui::Margin::same(10.0)),
+            )
             .show(ctx, |ui| self.render(ui));
 
         // Keep the indexer-spinner moving and the live counters honest
@@ -517,35 +591,51 @@ impl GuiApp {
         self.render_help_bar(ui);
     }
 
-    /// Faux Win9x title strip — rendered inside the client area so the
-    /// system window decorations stay clickable but the *content*
-    /// announces the look. Carries the brand pill, the watched root,
-    /// and the live indexer counters.
+    /// Title strip across the top of the client area. Filled with a
+    /// horizontal magenta→cyan gradient (the iconic 80s sunset
+    /// reduced to two waypoints), brand + watched root on the left,
+    /// live indexer counters on the right. Outlined with a 1px hot-
+    /// pink stroke so the gradient still reads as a bounded chrome
+    /// element.
     fn render_titlebar(&self, ui: &mut Ui) {
         let snap = snapshot_progress(&self.progress);
-        let height = 22.0;
+        let height = 26.0;
         let (rect, _) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), height),
             Sense::hover(),
         );
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, TITLE_BLUE);
 
-        // Left: "pdffff <root>".
-        let brand = format!("  pdffff  ");
+        paint_horizontal_gradient(&painter, rect, ACCENT_MAGENTA, ACCENT_CYAN);
+        // Outline the strip in hot pink. Keeps the gradient bounded
+        // on the eye even when the window is very wide.
+        painter.rect_stroke(rect, 0.0, Stroke::new(1.0, BEVEL_LIGHT));
+
         let body_font = FontId::new(13.0, FontFamily::Proportional);
-        let brand_galley = painter.layout_no_wrap(brand, body_font.clone(), Color32::WHITE);
-        let brand_pos = Pos2::new(rect.left() + 4.0, rect.center().y - brand_galley.size().y / 2.0);
-        painter.galley(brand_pos, brand_galley.clone(), Color32::WHITE);
+
+        // Left: "pdffff <root>" in cream, faintly shadow-stamped for
+        // the chunky text feel.
+        let brand = "  pdffff  ".to_string();
+        let brand_galley =
+            painter.layout_no_wrap(brand, body_font.clone(), TEXT_LIGHT);
+        let brand_pos = Pos2::new(
+            rect.left() + 6.0,
+            rect.center().y - brand_galley.size().y / 2.0,
+        );
+        // 1px text-shadow for that CRT-bleed feel.
+        let brand_shadow =
+            painter.layout_no_wrap("  pdffff  ".to_string(), body_font.clone(), BG_DEEP);
+        painter.galley(brand_pos + Vec2::new(1.0, 1.0), brand_shadow, BG_DEEP);
+        painter.galley(brand_pos, brand_galley.clone(), TEXT_LIGHT);
 
         let root_text = format!("{}", self.opts.root.display());
         let root_galley =
-            painter.layout_no_wrap(root_text, body_font.clone(), Color32::WHITE);
+            painter.layout_no_wrap(root_text, body_font.clone(), TEXT_LIGHT);
         let root_pos = Pos2::new(
-            brand_pos.x + brand_galley.size().x + 4.0,
+            brand_pos.x + brand_galley.size().x + 6.0,
             rect.center().y - root_galley.size().y / 2.0,
         );
-        painter.galley(root_pos, root_galley, Color32::WHITE);
+        painter.galley(root_pos, root_galley, TEXT_LIGHT);
 
         // Right: status counters + spinner.
         let spinner_idx = (self.spinner_started.elapsed().as_millis() / 100) as usize
@@ -559,41 +649,36 @@ impl GuiApp {
             "{} ok · {} empty · {} err · {} del · {}  ",
             snap.ok, snap.empty, snap.error, snap.deleted, activity,
         );
-        let counters_galley =
-            painter.layout_no_wrap(counters, body_font, Color32::WHITE);
+        let counters_galley = painter.layout_no_wrap(counters, body_font, TEXT_LIGHT);
         let counters_pos = Pos2::new(
-            rect.right() - counters_galley.size().x - 4.0,
+            rect.right() - counters_galley.size().x - 6.0,
             rect.center().y - counters_galley.size().y / 2.0,
         );
-        painter.galley(counters_pos, counters_galley, Color32::WHITE);
+        painter.galley(counters_pos, counters_galley, TEXT_LIGHT);
     }
 
     /// Query input + mode pill. The input is a sunken text well with a
-    /// "❯" prompt; the mode pill is a raised button that cycles the
-    /// mode on click.
+    /// hot-pink prompt arrow; the mode pill is a raised neon-bordered
+    /// button that cycles the mode on click.
     fn render_input(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("❯").color(Color32::BLACK).strong());
+            ui.label(
+                RichText::new("❯")
+                    .color(BEVEL_LIGHT)
+                    .strong(),
+            );
 
             let edit = TextEdit::singleline(&mut self.query)
                 .desired_width(ui.available_width() - 80.0)
                 .frame(false)
-                .text_color(Color32::BLACK)
-                .margin(Vec2::new(4.0, 3.0));
-            let edit_rect_before = ui.available_rect_before_wrap();
+                .text_color(TEXT_LIGHT)
+                .margin(Vec2::new(6.0, 4.0));
             let resp = ui.add(edit);
-            // Paint the sunken well behind the text.
-            let well = resp.rect.expand2(Vec2::new(0.0, 0.0));
-            // We need to draw the bevel *behind* the text — easiest is
-            // to use the painter on a layer below. Since egui paints
-            // bottom-up in order of widget addition, the bevel painted
-            // here lands on top. To avoid that, paint a filled white
-            // rect *and* the bevel *before* the TextEdit by allocating
-            // the area first; but that requires a layout dance. The
-            // simpler, cheap-to-reason about path: paint the well via
-            // an early-layer painter that targets the same rect.
+            // Paint the sunken well behind the text on the background
+            // layer (so widget paint lands on top).
+            let well = resp.rect;
             let painter = ui.ctx().layer_painter(egui::LayerId::background());
-            painter.rect_filled(well, 0.0, Color32::WHITE);
+            painter.rect_filled(well, 0.0, WELL_FILL);
             paint_bevel(&painter, well, false);
 
             if resp.changed() {
@@ -607,30 +692,39 @@ impl GuiApp {
                 resp.request_focus();
                 self.did_initial_focus = true;
             }
-            // Keep the rect-before-wrap usable downstream.
-            let _ = edit_rect_before;
 
             ui.add_space(8.0);
-            // Mode pill — raised button look.
+            // Mode pill — raised neon-bordered button.
             let label = match self.mode {
                 QueryMode::Literal => " LIT ",
                 QueryMode::Regex => " RE ",
                 QueryMode::Fuzzy => " FZ ",
             };
             let (pill_rect, pill_resp) = ui.allocate_exact_size(
-                Vec2::new(46.0, 22.0),
+                Vec2::new(52.0, 24.0),
                 Sense::click(),
             );
             let pp = ui.painter_at(pill_rect);
             pp.rect_filled(pill_rect, 0.0, FACE);
-            paint_bevel(&pp, pill_rect, !pill_resp.is_pointer_button_down_on());
+            // Pressed → invert the bevel so the click reads as a real
+            // depress. Hovered → keep the raised look but pre-glow the
+            // background via a hint of pink to telegraph interactivity.
+            let pressed = pill_resp.is_pointer_button_down_on();
+            if pill_resp.hovered() && !pressed {
+                pp.rect_filled(
+                    pill_rect.shrink(1.0),
+                    0.0,
+                    Color32::from_rgba_premultiplied(0x40, 0x18, 0x60, 0xff),
+                );
+            }
+            paint_bevel(&pp, pill_rect, !pressed);
             let body_font = FontId::new(13.0, FontFamily::Proportional);
-            let galley = pp.layout_no_wrap(label.to_string(), body_font, Color32::BLACK);
+            let galley = pp.layout_no_wrap(label.to_string(), body_font, TEXT_LIGHT);
             let p = Pos2::new(
                 pill_rect.center().x - galley.size().x / 2.0,
                 pill_rect.center().y - galley.size().y / 2.0,
             );
-            pp.galley(p, galley, Color32::BLACK);
+            pp.galley(p, galley, TEXT_LIGHT);
             if pill_resp.clicked() {
                 self.cycle_mode();
             }
@@ -640,46 +734,57 @@ impl GuiApp {
     fn render_separator_or_error(&self, ui: &mut Ui) {
         if let Some(err) = &self.last_error {
             ui.horizontal(|ui| {
-                // Red "error" pill.
+                // Hot-pink "error" pill.
                 let label_text = " error ";
                 let body_font = FontId::new(13.0, FontFamily::Proportional);
                 let (label_rect, _) = ui.allocate_exact_size(
-                    Vec2::new(56.0, 20.0),
+                    Vec2::new(60.0, 22.0),
                     Sense::hover(),
                 );
                 let painter = ui.painter_at(label_rect);
                 painter.rect_filled(label_rect, 0.0, ERROR_BG);
+                paint_bevel(&painter, label_rect, true);
                 let galley = painter.layout_no_wrap(
                     label_text.to_string(),
                     body_font,
-                    Color32::WHITE,
+                    BG_DEEP,
                 );
                 let p = Pos2::new(
                     label_rect.center().x - galley.size().x / 2.0,
                     label_rect.center().y - galley.size().y / 2.0,
                 );
-                painter.galley(p, galley, Color32::WHITE);
-                ui.add_space(4.0);
+                painter.galley(p, galley, BG_DEEP);
+                ui.add_space(6.0);
                 ui.label(RichText::new(err).color(ERROR_BG));
             });
         } else {
-            // Thin grey horizontal rule, drawn as two adjacent 1px
-            // lines to mirror the Win9x "etched groupbox" separator.
+            // 1px gradient rule magenta → cyan, with a faint glow row
+            // below it. Replaces the etched-groove Win9x separator
+            // with the vapourwave horizon line.
             let (rect, _) = ui.allocate_exact_size(
-                Vec2::new(ui.available_width(), 2.0),
+                Vec2::new(ui.available_width(), 3.0),
                 Sense::hover(),
             );
             let painter = ui.painter_at(rect);
-            painter.line_segment(
-                [rect.left_top(), rect.right_top()],
-                Stroke::new(1.0, BEVEL_DARK),
-            );
-            painter.line_segment(
-                [
-                    Pos2::new(rect.left(), rect.top() + 1.0),
+            paint_horizontal_gradient(
+                &painter,
+                Rect::from_min_max(
+                    rect.left_top(),
                     Pos2::new(rect.right(), rect.top() + 1.0),
-                ],
-                Stroke::new(1.0, BEVEL_LIGHT),
+                ),
+                ACCENT_MAGENTA,
+                ACCENT_CYAN,
+            );
+            // A 1px translucent twin slightly offset for the "neon
+            // bleed" feel.
+            paint_horizontal_gradient(
+                &painter,
+                Rect::from_min_max(
+                    Pos2::new(rect.left(), rect.top() + 2.0),
+                    Pos2::new(rect.right(), rect.top() + 3.0),
+                ),
+                Color32::from_rgba_premultiplied(0x6a, 0x18, 0x52, 0x80),
+                Color32::from_rgba_premultiplied(0x00, 0x52, 0x67, 0x80),
             );
         }
     }
@@ -694,7 +799,7 @@ impl GuiApp {
             };
             ui.vertical_centered(|ui| {
                 ui.add_space(20.0);
-                ui.label(RichText::new(msg).italics().color(BEVEL_DARK));
+                ui.label(RichText::new(msg).italics().color(TEXT_DIM));
             });
             self.prev_selected = self.selected;
             return;
@@ -741,40 +846,41 @@ impl GuiApp {
     fn render_help_bar(&self, ui: &mut Ui) {
         ui.add_space(4.0);
         let (rect, _) = ui.allocate_exact_size(
-            Vec2::new(ui.available_width(), 20.0),
+            Vec2::new(ui.available_width(), 22.0),
             Sense::hover(),
         );
         let painter = ui.painter_at(rect);
-        // Two-tone etched rule across the top of the strip.
-        painter.line_segment(
-            [rect.left_top(), rect.right_top()],
-            Stroke::new(1.0, BEVEL_DARK),
-        );
-        painter.line_segment(
-            [
-                Pos2::new(rect.left(), rect.top() + 1.0),
+        // Gradient horizon line on top of the strip — mirrors the
+        // separator above the results.
+        paint_horizontal_gradient(
+            &painter,
+            Rect::from_min_max(
+                rect.left_top(),
                 Pos2::new(rect.right(), rect.top() + 1.0),
-            ],
-            Stroke::new(1.0, BEVEL_LIGHT),
+            ),
+            ACCENT_CYAN,
+            ACCENT_MAGENTA,
         );
         let help =
             "↑↓ select   Tab mode   Enter open   Ctrl+U clear   Ctrl+W word-erase   Esc quit";
         let font = FontId::new(12.0, FontFamily::Proportional);
         let galley =
-            painter.layout_no_wrap(help.to_string(), font, BEVEL_DARK);
+            painter.layout_no_wrap(help.to_string(), font, TEXT_DIM);
         let p = Pos2::new(
-            rect.left() + 4.0,
+            rect.left() + 6.0,
             rect.center().y - galley.size().y / 2.0 + 1.0,
         );
-        painter.galley(p, galley, BEVEL_DARK);
+        painter.galley(p, galley, TEXT_DIM);
     }
 }
 
 /// One result card. Returns the click response so the caller can pick
-/// it. The card is a raised bevelled tile when unselected; the
-/// selected card replaces the top edge with a navy bar to mirror the
-/// TUI's magenta-bordered selection while keeping the surrounding
-/// chrome consistent.
+/// it. The card is a raised tile with a hot-pink bevel; the selected
+/// card replaces the top edge with a cyan glow strip and outlines the
+/// whole tile in cyan, mirroring the TUI's "border-only" selection
+/// cue in vapourwave grammar. Each card sits on top of a faux
+/// drop-shadow stack painted on the panel-level painter so the shadow
+/// extends beyond the card's own footprint.
 fn render_hit_card(
     ui: &mut Ui,
     i: usize,
@@ -795,36 +901,56 @@ fn render_hit_card(
 
     let body_font = FontId::new(13.0, FontFamily::Proportional);
 
-    // Reserve space: title row (20px) + snippet row (40px wrapping) +
-    // 8px padding top/bottom + 1px bevel.
-    let desired = Vec2::new(ui.available_width(), 64.0);
+    // Reserve space: title row (20px) + snippet row + padding +
+    // bevel + room for the drop-shadow stack below.
+    let desired = Vec2::new(ui.available_width(), 66.0);
     let (rect, resp) = ui.allocate_exact_size(desired, Sense::click());
+
+    // Drop shadow: stack three translucent rects offset down-right,
+    // each smaller in alpha. egui has no gaussian blur; this fake is
+    // cheap and reads as a soft glow. Painted on the panel-level
+    // painter (not `ui.painter_at(rect)`) so it can spill outside the
+    // card's own allocation.
+    let panel_painter = ui.painter();
+    for step in 1..=4 {
+        let off = step as f32 * 1.5;
+        let alpha = (0x50_u8).saturating_sub(step as u8 * 0x12);
+        let c = Color32::from_rgba_unmultiplied(
+            SHADOW_PINK.r(),
+            SHADOW_PINK.g(),
+            SHADOW_PINK.b(),
+            alpha,
+        );
+        let shadow_rect = rect.translate(Vec2::new(off, off));
+        panel_painter.rect_filled(shadow_rect, 0.0, c);
+    }
+
     let painter = ui.painter_at(rect);
 
-    // Card body — raised tile.
+    // Card body — raised tile with a hot-pink bevel.
     painter.rect_filled(rect, 0.0, FACE);
     paint_bevel(&painter, rect, true);
 
-    // Selection accent: a 3px navy strip along the top, inside the
-    // bevel. Matches the TUI's "border-only" selection cue while
-    // playing nice with the Win9x palette.
+    // Selection cue: outline the whole tile in cyan, plus a 3px cyan
+    // strip along the top of the body for that "active row" glow.
     if selected {
+        painter.rect_stroke(rect, 0.0, Stroke::new(1.0, ACCENT_CYAN));
         let accent = Rect::from_min_max(
             Pos2::new(rect.left() + 1.0, rect.top() + 1.0),
             Pos2::new(rect.right() - 1.0, rect.top() + 4.0),
         );
-        painter.rect_filled(accent, 0.0, TITLE_BLUE);
+        painter.rect_filled(accent, 0.0, ACCENT_CYAN);
     }
 
-    let inner = rect.shrink2(Vec2::new(8.0, 6.0));
+    let inner = rect.shrink2(Vec2::new(10.0, 8.0));
 
     // Title row: "1. filename" left-aligned, meta right-aligned.
     let title_y = inner.top();
     let prefix = format!("{}. ", i + 1);
     let prefix_galley =
-        painter.layout_no_wrap(prefix.clone(), body_font.clone(), Color32::BLACK);
+        painter.layout_no_wrap(prefix.clone(), body_font.clone(), TEXT_DIM);
     let prefix_pos = Pos2::new(inner.left(), title_y);
-    painter.galley(prefix_pos, prefix_galley.clone(), Color32::BLACK);
+    painter.galley(prefix_pos, prefix_galley.clone(), TEXT_DIM);
 
     paint_highlighted(
         &painter,
@@ -832,16 +958,16 @@ fn render_hit_card(
         &hit.filename,
         query,
         &body_font,
-        Color32::BLACK,
+        TEXT_LIGHT,
         true,
     );
 
-    // Meta string right-aligned.
-    let meta_galley = painter.layout_no_wrap(meta.clone(), body_font.clone(), BEVEL_DARK);
+    // Meta string right-aligned, in the secondary lavender.
+    let meta_galley = painter.layout_no_wrap(meta.clone(), body_font.clone(), TEXT_DIM);
     let meta_pos = Pos2::new(inner.right() - meta_galley.size().x, title_y);
-    painter.galley(meta_pos, meta_galley, BEVEL_DARK);
+    painter.galley(meta_pos, meta_galley, TEXT_DIM);
 
-    // Snippet row, wrapped to inner width.
+    // Snippet row.
     let snippet_origin = Pos2::new(inner.left(), title_y + 20.0);
     paint_highlighted(
         &painter,
@@ -849,7 +975,7 @@ fn render_hit_card(
         &hit.snippet,
         query,
         &body_font,
-        Color32::BLACK,
+        TEXT_LIGHT,
         false,
     );
 
