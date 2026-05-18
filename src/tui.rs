@@ -86,7 +86,6 @@ use crossterm::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     },
 };
-use parking_lot::{Condvar, Mutex};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -97,15 +96,13 @@ use ratatui::{
 };
 use std::io::{self, Stdout};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::app::{IndexProgress, WatchHandle};
-use crate::index::IndexState;
-use crate::query::{DISPLAY_LIMIT, Hit, QueryMode, search};
+use crate::query::{DISPLAY_LIMIT, Hit, QueryMode};
 use crate::ui::highlight::{SegmentKind, SnippetSegment, highlight_segments};
+use crate::ui::search::{SearchRequest, SearchWorker};
 
 /// How often (at most) we redraw the screen when no key is pressed.
 /// Drives the indexing-status spinner and the elapsed-time counter.
@@ -486,134 +483,6 @@ fn drain_results(state: &mut AppState, worker: &SearchWorker) -> bool {
         }
     }
     true
-}
-
-// ──────────────────────────── search worker ────────────────────────
-//
-// A single background thread owns the `Arc<IndexState>` and runs
-// searches off the input thread. The TUI talks to it through a one-slot
-// mailbox: every submission overwrites the pending request, so a burst
-// of keystrokes (typing, key-repeat on Backspace) collapses to a single
-// search of the *latest* query. This is the entire point of the
-// concurrency layer — it's what keeps Backspace instant on a corpus
-// large enough that one search takes hundreds of milliseconds.
-
-/// A single pending search submitted to the worker.
-#[derive(Debug, Clone)]
-struct SearchRequest {
-    stamp: u64,
-    query: String,
-    mode: QueryMode,
-    limit: usize,
-}
-
-/// A search the worker has finished, ready for the TUI to apply.
-struct SearchResult {
-    stamp: u64,
-    hits: Result<Vec<Hit>>,
-}
-
-/// One-slot mailbox guarded by a condvar.
-///
-/// `pending` is the next request to run; the worker takes it and runs
-/// it, then loops back to wait for the next. `closed` lets the TUI
-/// signal shutdown without sending a sentinel request.
-struct SearchSlot {
-    pending: Option<SearchRequest>,
-    closed: bool,
-}
-
-/// Handle held by the TUI. Drop / [`SearchWorker::stop`] tear down the
-/// background thread.
-struct SearchWorker {
-    slot: Arc<(Mutex<SearchSlot>, Condvar)>,
-    result: Arc<Mutex<Option<SearchResult>>>,
-    handle: Option<thread::JoinHandle<()>>,
-}
-
-impl SearchWorker {
-    fn spawn(state: Arc<IndexState>) -> Result<Self> {
-        let slot = Arc::new((
-            Mutex::new(SearchSlot {
-                pending: None,
-                closed: false,
-            }),
-            Condvar::new(),
-        ));
-        let result: Arc<Mutex<Option<SearchResult>>> = Arc::new(Mutex::new(None));
-        let slot_for_thread = slot.clone();
-        let result_for_thread = result.clone();
-        let handle = thread::Builder::new()
-            .name("pdffff-tui-search".into())
-            .spawn(move || worker_loop(state, slot_for_thread, result_for_thread))
-            .context("spawning pdffff-tui-search thread")?;
-        Ok(Self {
-            slot,
-            result,
-            handle: Some(handle),
-        })
-    }
-
-    /// Overwrite the pending slot with `req` and wake the worker. If the
-    /// worker is mid-search it finishes that search first; the new
-    /// request runs next. Older pending requests are dropped silently —
-    /// that's the coalescing behaviour the input thread depends on.
-    fn submit(&self, req: SearchRequest) {
-        let (m, cv) = &*self.slot;
-        let mut s = m.lock();
-        s.pending = Some(req);
-        cv.notify_one();
-    }
-
-    /// Pop the latest published result, if any.
-    fn take_result(&self) -> Option<SearchResult> {
-        self.result.lock().take()
-    }
-
-    /// Signal the worker to exit and join it. Idempotent; safe to call
-    /// from a drop guard or an explicit shutdown.
-    fn stop(mut self) {
-        {
-            let (m, cv) = &*self.slot;
-            let mut s = m.lock();
-            s.closed = true;
-            cv.notify_one();
-        }
-        if let Some(h) = self.handle.take() {
-            // Best-effort: a worker panic would already have been
-            // surfaced through `result` as an `Err`, so a Join error
-            // here is purely shutdown noise we don't want to leak into
-            // the TUI's exit path.
-            let _ = h.join();
-        }
-    }
-}
-
-fn worker_loop(
-    state: Arc<IndexState>,
-    slot: Arc<(Mutex<SearchSlot>, Condvar)>,
-    result: Arc<Mutex<Option<SearchResult>>>,
-) {
-    let (m, cv) = &*slot;
-    loop {
-        let request = {
-            let mut s = m.lock();
-            loop {
-                if s.closed {
-                    return;
-                }
-                if let Some(r) = s.pending.take() {
-                    break r;
-                }
-                cv.wait(&mut s);
-            }
-        };
-        let hits = search(&state, &request.query, request.mode, request.limit);
-        *result.lock() = Some(SearchResult {
-            stamp: request.stamp,
-            hits,
-        });
-    }
 }
 
 // ──────────────────────────── rendering ────────────────────────────

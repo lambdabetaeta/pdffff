@@ -9,8 +9,12 @@
 //! * [`highlight`] — neutral snippet/title highlighting that returns
 //!   frontend-agnostic [`highlight::SnippetSegment`]s. Each frontend
 //!   maps segments to its own widget vocabulary.
+//! * [`search`] — the off-thread search worker every frontend uses to
+//!   keep input responsive against a large corpus. One-slot mailbox,
+//!   stamp-based stale-result rejection.
 //!
 //! Each frontend lives in its own module / binary on top of this
 //! kernel.
 
 pub mod highlight;
+pub mod search;
