@@ -33,6 +33,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use pdffff::app::{WatchOptions, resolve_db_path, run_watch};
 use pdffff::query::{DISPLAY_LIMIT, QueryMode};
 use pdffff::tui::{TuiOptions, run_tui};
+use pdffff::ui::launch::OnPick;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -78,6 +79,14 @@ struct Cli {
     /// Default: $TMPDIR/pdffff.log.
     #[arg(long)]
     log_file: Option<PathBuf>,
+
+    /// Selector mode: pressing Enter on a result exits the TUI and
+    /// prints the picked file's path to stdout, so pdffff composes
+    /// with shell pipelines (e.g. `pdffff /papers --print-path |
+    /// xargs dirname`). Without this flag, Enter opens the file in
+    /// the host's PDF viewer and the TUI keeps running.
+    #[arg(long)]
+    print_path: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -118,15 +127,26 @@ fn main() -> Result<()> {
     };
     let handle = run_watch(&db_path, &cli.root, &opts)?;
 
+    let on_pick = if cli.print_path {
+        OnPick::SelectAndExit
+    } else {
+        OnPick::OpenInViewer
+    };
     let tui_opts = TuiOptions {
         limit: cli.limit,
         initial_mode: cli.mode.to_query_mode(),
         root: cli.root.clone(),
+        on_pick,
     };
-    // Enter on a hit now opens the file in the host's PDF viewer
-    // without exiting the TUI; the launcher just runs the session
-    // until the user quits via Esc / Ctrl+C/D/Q.
-    run_tui(handle, tui_opts)
+    let chosen = run_tui(handle, tui_opts)?;
+    // In `OpenInViewer` mode `chosen` is always None — the file was
+    // opened inline and the user just quit. In `SelectAndExit` mode
+    // it carries the picked hit, and we print the absolute path on
+    // stdout so the launcher composes with shell pipelines.
+    if let Some(hit) = chosen {
+        println!("{}", hit.path);
+    }
+    Ok(())
 }
 
 /// Tracing subscriber that writes to `path` (or `$TMPDIR/pdffff.log`

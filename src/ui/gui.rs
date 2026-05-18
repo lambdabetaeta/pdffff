@@ -66,8 +66,9 @@ use std::time::{Duration, Instant};
 use crate::app::{IndexProgress, WatchHandle};
 use crate::query::{DISPLAY_LIMIT, Hit, QueryMode};
 use crate::ui::highlight::{SegmentKind, highlight_segments};
-use crate::ui::launch::open_in_system_viewer;
+use crate::ui::launch::{OnPick, open_in_system_viewer};
 use crate::ui::search::{SearchRequest, SearchWorker};
+use parking_lot::Mutex;
 
 // ───────────────────────── Windows 95 palette ───────────────────────
 //
@@ -162,6 +163,10 @@ pub struct GuiOptions {
     pub limit: usize,
     pub initial_mode: QueryMode,
     pub root: PathBuf,
+    /// What Enter / double-click on a result does. Defaults to
+    /// opening the file in the host's PDF viewer and keeping the
+    /// window alive.
+    pub on_pick: OnPick,
 }
 
 impl Default for GuiOptions {
@@ -170,6 +175,7 @@ impl Default for GuiOptions {
             limit: DISPLAY_LIMIT,
             initial_mode: QueryMode::Fuzzy,
             root: PathBuf::new(),
+            on_pick: OnPick::default(),
         }
     }
 }
@@ -180,7 +186,14 @@ impl Default for GuiOptions {
 /// indexer threads on the way out, returns `Some(hit)` if the user
 /// activated a result so the caller can hand it to the system PDF
 /// viewer.
-pub fn run_gui(handle: WatchHandle, opts: GuiOptions) -> Result<()> {
+pub fn run_gui(handle: WatchHandle, opts: GuiOptions) -> Result<Option<Hit>> {
+    // Cross-thread handoff for the "selector" mode: the GuiApp writes
+    // the chosen hit here before requesting window close, and we read
+    // it out after `run_native` returns. Stays `None` in OpenInViewer
+    // mode.
+    let chosen: Arc<Mutex<Option<Hit>>> = Arc::new(Mutex::new(None));
+    let chosen_for_app = chosen.clone();
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1020.0, 720.0])
@@ -196,13 +209,15 @@ pub fn run_gui(handle: WatchHandle, opts: GuiOptions) -> Result<()> {
         Box::new(move |cc| {
             apply_font_fallback(&cc.egui_ctx);
             apply_win98_visuals(&cc.egui_ctx);
-            let app = GuiApp::new(handle, opts_for_app, cc.egui_ctx.clone())?;
+            let app =
+                GuiApp::new(handle, opts_for_app, chosen_for_app, cc.egui_ctx.clone())?;
             Ok(Box::new(app))
         }),
     )
     .map_err(|e| anyhow!("eframe::run_native: {e}"))?;
 
-    Ok(())
+    let result = chosen.lock().take();
+    Ok(result)
 }
 
 // ─────────────────────────── styling ────────────────────────────────
@@ -429,6 +444,11 @@ struct GuiApp {
     /// not steal it back on every repaint.
     did_initial_focus: bool,
 
+    /// In `OnPick::SelectAndExit` mode, written when the user
+    /// activates a result so the outer `run_gui` can read it after
+    /// `run_native` returns. Stays empty in `OpenInViewer` mode.
+    chosen: Arc<Mutex<Option<Hit>>>,
+
     // True once we've requested the system window to close.
     closing: bool,
 }
@@ -437,6 +457,7 @@ impl GuiApp {
     fn new(
         handle: WatchHandle,
         opts: GuiOptions,
+        chosen: Arc<Mutex<Option<Hit>>>,
         _ctx: egui::Context,
     ) -> Result<Self> {
         let progress = handle.progress.clone();
@@ -457,6 +478,7 @@ impl GuiApp {
             applied_stamp: 0,
             spinner_started: Instant::now(),
             did_initial_focus: false,
+            chosen,
             closing: false,
         })
     }
@@ -542,21 +564,34 @@ impl GuiApp {
         self.selected = Some(next as usize);
     }
 
-    /// Hand the selected result's path to the system PDF viewer. The
-    /// session stays open afterwards — the user can keep searching
-    /// and open more results. Errors from the viewer surface in the
-    /// in-screen error pill (the GUI owns the window and cannot
-    /// print to stderr).
+    /// Activate the currently-selected result. Branches on
+    /// `opts.on_pick`:
+    ///
+    /// * `OpenInViewer` (default) — hand the path to the host's PDF
+    ///   viewer and keep the window open. Errors surface in the
+    ///   in-screen error pill (the GUI owns the window and cannot
+    ///   print to stderr).
+    /// * `SelectAndExit` — stash the hit in `self.chosen` and request
+    ///   window close so `run_gui` can read it back out after
+    ///   `run_native` returns.
     fn pick_selected(&mut self) {
         if let Some(i) = self.selected {
             if let Some(hit) = self.hits.get(i) {
-                if let Err(err) = open_in_system_viewer(&hit.path) {
-                    self.last_error = Some(format!(
-                        "could not open {}: {err:#}",
-                        hit.path
-                    ));
-                } else {
-                    self.last_error = None;
+                match self.opts.on_pick {
+                    OnPick::OpenInViewer => {
+                        if let Err(err) = open_in_system_viewer(&hit.path) {
+                            self.last_error = Some(format!(
+                                "could not open {}: {err:#}",
+                                hit.path
+                            ));
+                        } else {
+                            self.last_error = None;
+                        }
+                    }
+                    OnPick::SelectAndExit => {
+                        *self.chosen.lock() = Some(hit.clone());
+                        self.closing = true;
+                    }
                 }
             }
         }

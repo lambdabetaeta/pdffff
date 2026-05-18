@@ -16,6 +16,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use pdffff::app::{WatchOptions, resolve_db_path, run_watch};
 use pdffff::query::{DISPLAY_LIMIT, QueryMode};
 use pdffff::ui::gui::{GuiOptions, run_gui};
+use pdffff::ui::launch::OnPick;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -50,6 +51,15 @@ struct Cli {
     /// Tracing log file. Default: $TMPDIR/pdffff-gui.log.
     #[arg(long)]
     log_file: Option<PathBuf>,
+
+    /// Selector mode: activating a result closes the GUI and prints
+    /// the picked file's path to stdout, so pdffff-gui can be
+    /// invoked from a shell script (e.g.
+    /// `$(pdffff-gui /papers --print-path)`). Without this flag,
+    /// activating a result opens the file in the host's PDF viewer
+    /// and the GUI stays open.
+    #[arg(long)]
+    print_path: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -88,15 +98,22 @@ fn main() -> Result<()> {
     };
     let handle = run_watch(&db_path, &cli.root, &opts)?;
 
+    let on_pick = if cli.print_path {
+        OnPick::SelectAndExit
+    } else {
+        OnPick::OpenInViewer
+    };
     let gui_opts = GuiOptions {
         limit: cli.limit,
         initial_mode: cli.mode.to_query_mode(),
         root: cli.root.clone(),
+        on_pick,
     };
-    // Activating a hit now opens the file in the host's PDF viewer
-    // without exiting the GUI; the launcher just runs the session
-    // until the user closes the window.
-    run_gui(handle, gui_opts)
+    let chosen = run_gui(handle, gui_opts)?;
+    if let Some(hit) = chosen {
+        println!("{}", hit.path);
+    }
+    Ok(())
 }
 
 fn init_tracing_to_file(path: Option<&Path>) -> Result<()> {

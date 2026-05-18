@@ -102,7 +102,7 @@ use std::time::{Duration, Instant};
 use crate::app::{IndexProgress, WatchHandle};
 use crate::query::{DISPLAY_LIMIT, Hit, QueryMode};
 use crate::ui::highlight::{SegmentKind, SnippetSegment, highlight_segments};
-use crate::ui::launch::open_in_system_viewer;
+use crate::ui::launch::{OnPick, open_in_system_viewer};
 use crate::ui::search::{SearchRequest, SearchWorker};
 
 /// How often (at most) we redraw the screen when no key is pressed.
@@ -155,6 +155,9 @@ pub struct TuiOptions {
     /// Root being watched; rendered in the status bar so the user
     /// remembers what they're searching.
     pub root: PathBuf,
+    /// What Enter on a result does. Defaults to opening the file in
+    /// the host's PDF viewer and keeping the session alive.
+    pub on_pick: OnPick,
 }
 
 impl Default for TuiOptions {
@@ -163,6 +166,7 @@ impl Default for TuiOptions {
             limit: DISPLAY_LIMIT,
             initial_mode: QueryMode::Fuzzy,
             root: PathBuf::new(),
+            on_pick: OnPick::default(),
         }
     }
 }
@@ -171,12 +175,16 @@ impl Default for TuiOptions {
 /// occurs. Owns `handle`: calls [`WatchHandle::stop`] on the way out
 /// so the index threads always shut down cleanly, even on panic.
 ///
-/// Pressing Enter on a selected result hands the path to the host's
-/// default PDF viewer via [`crate::ui::launch::open_in_system_viewer`]
-/// without ending the session — the user can keep searching and open
-/// further results. Errors from the launcher surface in the in-screen
-/// error pill rather than corrupting the alternate-screen output.
-pub fn run_tui(handle: WatchHandle, opts: TuiOptions) -> Result<()> {
+/// Behaviour on Enter depends on `opts.on_pick`:
+/// * [`OnPick::OpenInViewer`] (default) — hand the path to the host's
+///   PDF viewer via [`crate::ui::launch::open_in_system_viewer`] and
+///   keep the session alive. Errors surface in the in-screen error
+///   pill rather than corrupting the alternate-screen output.
+///   `run_tui` returns `Ok(None)` on plain quit.
+/// * [`OnPick::SelectAndExit`] — capture the chosen `Hit`, exit the
+///   session, and return `Ok(Some(hit))` so the launcher can print
+///   the path to stdout for shell pipelines.
+pub fn run_tui(handle: WatchHandle, opts: TuiOptions) -> Result<Option<Hit>> {
     let mut terminal = setup_terminal().context("entering TUI terminal mode")?;
     install_panic_hook();
 
@@ -192,10 +200,10 @@ pub fn run_tui(handle: WatchHandle, opts: TuiOptions) -> Result<()> {
     // the writer thread has finished draining its queue.
     let stop_result = handle.stop();
 
-    loop_result?;
+    let chosen = loop_result?;
     teardown?;
     stop_result?;
-    Ok(())
+    Ok(chosen)
 }
 
 /// Internal state of the render loop.
@@ -226,6 +234,10 @@ struct AppState {
     scroll_top: usize,
     /// True once the user has pressed one of the quit keys.
     should_quit: bool,
+    /// In [`OnPick::SelectAndExit`] mode, the hit the user picked on
+    /// Enter. `None` when `OnPick::OpenInViewer` (the default), since
+    /// that path opens the file in place and doesn't end the session.
+    chosen: Option<Hit>,
 }
 
 impl AppState {
@@ -241,6 +253,7 @@ impl AppState {
             spinner_started: Instant::now(),
             scroll_top: 0,
             should_quit: false,
+            chosen: None,
         }
     }
 
@@ -264,7 +277,7 @@ fn main_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     handle: &WatchHandle,
     opts: &TuiOptions,
-) -> Result<()> {
+) -> Result<Option<Hit>> {
     let worker = SearchWorker::spawn(handle.state.clone())
         .context("spawning TUI search worker")?;
     // Run the loop body in a helper so worker shutdown happens on every
@@ -279,7 +292,7 @@ fn run_event_loop(
     worker: &SearchWorker,
     progress: &IndexProgress,
     opts: &TuiOptions,
-) -> Result<()> {
+) -> Result<Option<Hit>> {
     let mut state = AppState::new(opts.initial_mode);
 
     // Snapshot of indexer counters at the last tick, so we can also
@@ -314,7 +327,7 @@ fn run_event_loop(
         }
     }
 
-    Ok(())
+    Ok(state.chosen)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -379,20 +392,30 @@ fn handle_key(
         }
 
         // ---- pick a hit --------------------------------------------------
-        // Pressing Enter on a selected result hands the path to the
-        // host's PDF viewer and keeps the search session running, so
-        // multiple files can be opened in sequence. Errors surface in
-        // the in-screen error pill rather than corrupting stderr.
+        // Default (`OnPick::OpenInViewer`): open the file in the host's
+        // PDF viewer and keep the session running so the user can pick
+        // more. Errors surface in the in-screen error pill rather than
+        // corrupting the alternate-screen output.
+        // Selector mode (`OnPick::SelectAndExit`): capture the hit and
+        // quit so the launcher can print the path to stdout.
         KeyCode::Enter => {
             if let Some(idx) = state.list_state.selected() {
                 if let Some(hit) = state.hits.get(idx) {
-                    if let Err(err) = open_in_system_viewer(&hit.path) {
-                        state.last_error = Some(format!(
-                            "could not open {}: {err:#}",
-                            hit.path
-                        ));
-                    } else {
-                        state.last_error = None;
+                    match opts.on_pick {
+                        OnPick::OpenInViewer => {
+                            if let Err(err) = open_in_system_viewer(&hit.path) {
+                                state.last_error = Some(format!(
+                                    "could not open {}: {err:#}",
+                                    hit.path
+                                ));
+                            } else {
+                                state.last_error = None;
+                            }
+                        }
+                        OnPick::SelectAndExit => {
+                            state.chosen = Some(hit.clone());
+                            state.should_quit = true;
+                        }
                     }
                 }
             }
