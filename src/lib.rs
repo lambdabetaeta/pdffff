@@ -44,4 +44,5 @@ pub mod paths;
 pub mod query;
 pub mod scanner;
 pub mod tui;
+pub mod ui;
 pub mod watcher;

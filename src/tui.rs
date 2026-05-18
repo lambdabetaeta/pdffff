@@ -105,6 +105,7 @@ use std::time::{Duration, Instant};
 use crate::app::{IndexProgress, WatchHandle};
 use crate::index::IndexState;
 use crate::query::{DISPLAY_LIMIT, Hit, QueryMode, search};
+use crate::ui::highlight::{SegmentKind, SnippetSegment, highlight_segments};
 
 /// How often (at most) we redraw the screen when no key is pressed.
 /// Drives the indexing-status spinner and the elapsed-time counter.
@@ -988,170 +989,28 @@ fn match_hl_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-/// Render `text` as a list of styled spans, painting case-insensitive
-/// substring matches for `query` (or its whitespace-split terms) with
-/// `hl` and the unmatched runs with `base`. Greedy left-to-right,
-/// longest-needle-wins — so a match on the full phrase takes
-/// precedence over its constituent terms. UTF-8 safe.
+/// Thin frontend adapter: ask the shared highlighter where the
+/// matches are, then paint each segment with `base` / `hl`.
 ///
-/// Three composed passes:
-///
-/// 1. [`build_needles`] — phrase + whitespace-split terms, deduped and
-///    sorted longest-first so the greedy matcher prefers the phrase
-///    over its constituents.
-/// 2. [`build_lc_offset_map`] — a lowercased copy of `text` and a
-///    table mapping lowercase byte offsets back to original byte
-///    offsets. Lowercasing changes byte length per codepoint, so the
-///    table is the only correct way to recover original-side spans.
-/// 3. [`scan_for_match_ranges`] — greedy left-to-right scan over the
-///    lowercase bytes for needle matches, emitting original-side
-///    `Range<usize>`s.
-///
-/// Span construction then weaves the unhighlighted runs between the
-/// match ranges. The function is style-agnostic so the same pipeline
-/// drives both snippet bodies (default base) and card titles (white
-/// bold base).
+/// The actual where-do-the-matches-fall logic lives in
+/// [`crate::ui::highlight`]; this module is style-agnostic so the GUI
+/// frontend can reuse exactly the same segmentation.
 fn highlight_spans(
     text: &str,
     query: &str,
     base: Style,
     hl: Style,
 ) -> Vec<Span<'static>> {
-    let needles = build_needles(query);
-    if needles.is_empty() {
-        return vec![Span::styled(text.to_string(), base)];
-    }
-    let map = build_lc_offset_map(text);
-    let ranges = scan_for_match_ranges(text, &map, &needles);
-    weave_spans(text, &ranges, base, hl)
-}
-
-/// Test-friendly wrapper that fixes the styles to the snippet defaults
-/// (no base style, match-highlight style for hits).
-#[cfg(test)]
-fn highlight_snippet_spans(snippet: &str, query: &str) -> Vec<Span<'static>> {
-    highlight_spans(snippet, query, Style::default(), match_hl_style())
-}
-
-/// Ordered, deduped match needles: full phrase + whitespace-split terms,
-/// sorted longest-first so longest-match-wins is a simple loop.
-fn build_needles(query: &str) -> Vec<String> {
-    let phrase = query.trim().to_lowercase();
-    if phrase.is_empty() {
-        return Vec::new();
-    }
-    let mut v = vec![phrase.clone()];
-    v.extend(
-        phrase
-            .split_whitespace()
-            .filter(|t| *t != phrase)
-            .map(|t| t.to_lowercase()),
-    );
-    v.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    v.dedup();
-    v
-}
-
-/// Lowercased copy of `snippet` together with a `lc_byte → orig_byte`
-/// table.
-///
-/// Lowercasing changes byte length per codepoint ('İ' → "i\u{307}"
-/// grows, 'ẞ' → "ß" shrinks), so positions in the two strings don't
-/// coincide. `lc_to_orig[i] = Some(orig)` marks lc byte offset `i` as
-/// a char boundary corresponding to original byte offset `orig`; mid-
-/// codepoint and lowercase-expansion offsets are `None`. The final
-/// entry pins the end-of-string boundary so a needle that lands at the
-/// very end has a well-defined `orig_end`.
-struct LcOffsetMap {
-    lc: String,
-    /// Indexed by lowercase byte offset, length = `lc.len() + 1`.
-    lc_to_orig: Vec<Option<usize>>,
-}
-
-fn build_lc_offset_map(snippet: &str) -> LcOffsetMap {
-    let mut lc = String::with_capacity(snippet.len());
-    let mut lc_to_orig: Vec<Option<usize>> = Vec::new();
-    for (orig_byte, ch) in snippet.char_indices() {
-        while lc_to_orig.len() < lc.len() {
-            lc_to_orig.push(None);
-        }
-        lc_to_orig.push(Some(orig_byte));
-        for lc_ch in ch.to_lowercase() {
-            lc.push(lc_ch);
-        }
-    }
-    while lc_to_orig.len() < lc.len() {
-        lc_to_orig.push(None);
-    }
-    lc_to_orig.push(Some(snippet.len()));
-    LcOffsetMap { lc, lc_to_orig }
-}
-
-/// Greedy left-to-right scan: at each char boundary in `map.lc`, try
-/// each needle in order (longest first) and emit the original-side
-/// match range. Returns ranges in left-to-right order, non-overlapping.
-fn scan_for_match_ranges(
-    snippet: &str,
-    map: &LcOffsetMap,
-    needles: &[String],
-) -> Vec<std::ops::Range<usize>> {
-    let lc_bytes = map.lc.as_bytes();
-    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
-    let mut lc_cursor = 0usize;
-    while lc_cursor < lc_bytes.len() {
-        let Some(orig_cursor) = map.lc_to_orig.get(lc_cursor).copied().flatten() else {
-            lc_cursor += 1;
-            continue;
-        };
-        let matched = needles.iter().find_map(|n| {
-            let lc_end = lc_cursor + n.len();
-            if lc_end > lc_bytes.len() || &lc_bytes[lc_cursor..lc_end] != n.as_bytes() {
-                return None;
-            }
-            map.lc_to_orig
-                .get(lc_end)
-                .copied()
-                .flatten()
-                .map(|orig_end| (n.len(), orig_end))
-        });
-        if let Some((lc_len, orig_end)) = matched {
-            ranges.push(orig_cursor..orig_end);
-            lc_cursor += lc_len;
-        } else {
-            // No match here — advance by the lowercase byte length of
-            // the next codepoint so the cursor stays on a boundary.
-            let lc_step: usize = match snippet[orig_cursor..].chars().next() {
-                Some(c) => c.to_lowercase().map(|x| x.len_utf8()).sum(),
-                None => break,
+    highlight_segments(text, query)
+        .into_iter()
+        .map(|SnippetSegment { text, kind }| {
+            let style = match kind {
+                SegmentKind::Plain => base,
+                SegmentKind::Match => hl,
             };
-            lc_cursor += lc_step.max(1);
-        }
-    }
-    ranges
-}
-
-/// Weave the unhighlighted prefixes / suffixes between the highlighted
-/// match `ranges` into a span list, applying `base` to the unmatched
-/// runs and `hl` to the matches.
-fn weave_spans(
-    text: &str,
-    ranges: &[std::ops::Range<usize>],
-    base: Style,
-    hl: Style,
-) -> Vec<Span<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut cursor = 0usize;
-    for r in ranges {
-        if cursor < r.start {
-            spans.push(Span::styled(text[cursor..r.start].to_string(), base));
-        }
-        spans.push(Span::styled(text[r.start..r.end].to_string(), hl));
-        cursor = r.end;
-    }
-    if cursor < text.len() {
-        spans.push(Span::styled(text[cursor..].to_string(), base));
-    }
-    spans
+            Span::styled(text, style)
+        })
+        .collect()
 }
 
 // ──────────────────────────── terminal setup ───────────────────────
@@ -1191,58 +1050,22 @@ fn install_panic_hook() {
 mod tests {
     use super::*;
 
-    fn render(spans: &[Span<'static>]) -> String {
-        spans.iter().map(|s| s.content.as_ref()).collect()
-    }
+    // Highlighter correctness is exercised in `crate::ui::highlight`
+    // — the snippet/title pipeline lives there and is frontend
+    // agnostic. The TUI-side adapter is a one-liner; here we cover
+    // only the TUI-specific concerns (style mapping + card layout
+    // maths).
 
     #[test]
-    fn highlight_plain_ascii() {
-        let spans = highlight_snippet_spans("Hello world", "world");
-        assert_eq!(render(&spans), "Hello world");
-        // "Hello " unhighlighted, "world" highlighted.
+    fn highlight_spans_apply_correct_styles() {
+        let base = Style::default().fg(PRIMARY);
+        let hl = match_hl_style();
+        let spans = highlight_spans("Hello world", "world", base, hl);
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].content.as_ref(), "Hello ");
+        assert_eq!(spans[0].style, base);
         assert_eq!(spans[1].content.as_ref(), "world");
-    }
-
-    #[test]
-    fn highlight_preserves_original_case() {
-        let spans = highlight_snippet_spans("HeLLo WoRLd", "hello");
-        assert_eq!(render(&spans), "HeLLo WoRLd");
-        assert_eq!(spans[0].content.as_ref(), "HeLLo");
-    }
-
-    // Regression: lowercasing 'ẞ' (U+1E9E, 3 bytes UTF-8) yields "ß"
-    // (2 bytes), so byte positions in `snippet` and its lowercase form
-    // diverge. Previously this overflowed the lowercase slice.
-    #[test]
-    fn highlight_handles_shrinking_lowercase() {
-        let spans = highlight_snippet_spans("STRAẞE", "stra");
-        assert_eq!(render(&spans), "STRAẞE");
-    }
-
-    // Regression: lowercasing 'İ' (U+0130, 2 bytes) yields "i\u{307}"
-    // (3 bytes), the other direction of length divergence.
-    #[test]
-    fn highlight_handles_growing_lowercase() {
-        let spans = highlight_snippet_spans("İstanbul", "istanbul");
-        assert_eq!(render(&spans), "İstanbul");
-    }
-
-    #[test]
-    fn highlight_empty_query_passes_through() {
-        let spans = highlight_snippet_spans("anything", "");
-        assert_eq!(render(&spans), "anything");
-        assert_eq!(spans.len(), 1);
-    }
-
-    #[test]
-    fn highlight_longest_needle_wins() {
-        // "foo bar" (full phrase) should win over "foo" / "bar" splits.
-        let spans = highlight_snippet_spans("a foo bar b", "foo bar");
-        assert_eq!(render(&spans), "a foo bar b");
-        assert_eq!(spans.len(), 3);
-        assert_eq!(spans[1].content.as_ref(), "foo bar");
+        assert_eq!(spans[1].style, hl);
     }
 
     // ── card-layout maths ─────────────────────────────────────────────
