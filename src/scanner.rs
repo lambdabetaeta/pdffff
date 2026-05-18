@@ -14,6 +14,7 @@ use anyhow::Result;
 use ignore::WalkBuilder;
 use std::collections::HashMap;
 use std::fs::Metadata;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -77,11 +78,15 @@ impl FileIdentity {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
+        #[cfg(unix)]
+        let (dev, ino) = (Some(md.dev() as i64), Some(md.ino() as i64));
+        #[cfg(windows)]
+        let (dev, ino) = (None, None);
         Self {
             size_bytes: md.len() as i64,
             mtime_ns,
-            dev: Some(md.dev() as i64),
-            ino: Some(md.ino() as i64),
+            dev,
+            ino,
         }
     }
 }
