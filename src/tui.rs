@@ -1,18 +1,25 @@
 //! Interactive TUI for `pdffff`.
 //!
-//! Visual layout (fzf-inspired, but tailored to the
-//! query-against-a-live-index workflow):
+//! Visual layout — Norton-Commander-revival palette with each visual
+//! variable carrying exactly one semantic role (Bertin's "semiology of
+//! graphics" applied to a 16-colour TTY): blue chrome, white primary
+//! text, dim secondary, magenta-bold for the selected card border, and
+//! yellow-on-black reserved exclusively for query matches (in titles
+//! *and* snippet bodies):
 //!
 //! ```text
-//!  ╭─ pdffff /Users/foo/papers ──────────  123 ok · 0 err · ⠿ indexing 3 ─╮
+//!  ╭─ pdffff /Users/foo/papers ─────────── 123 ok · 0 err · ⠿ indexing 3 ─╮
 //!  │                                                                       │
-//!  │  ❯ query▏                                                  LITERAL    │
+//!  │  ❯ alpha synthesis▏                                            LIT    │
 //!  │  ───────────────────────────────────────────────────────────────────  │
-//!  │   ▌ 1. paper.pdf                                            p.12 · #3 │
-//!  │       …matching snippet excerpt with highlighted terms…               │
-//!  │     2. other.pdf                              p. 1 · #0 · score 1247  │
-//!  │       …another snippet…                                               │
 //!  │                                                                       │
+//!  │  ╭ 1. paper.pdf ─────────────────────────────────── p.12 · #3 ─────╮  │
+//!  │  │  …matching snippet excerpt with highlighted terms…              │  │
+//!  │  ╰─────────────────────────────────────────────────────────────────╯  │
+//!  │                                                                       │
+//!  │  ╭ 2. other.pdf ──────────────────── p. 1 · #0 · score 1247 ──────╮   │
+//!  │  │  …another snippet…                                              │  │
+//!  │  ╰─────────────────────────────────────────────────────────────────╯  │
 //!  ╰─ ↑↓ select · Tab mode · Enter pick · Ctrl+U clear · Esc quit ─────────╯
 //! ```
 //!
@@ -86,10 +93,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, BorderType, Borders, HighlightSpacing, List, ListItem, ListState, Padding,
-        Paragraph,
-    },
+    widgets::{Block, BorderType, Borders, ListState, Padding, Paragraph},
 };
 use std::io::{self, Stdout};
 use std::path::PathBuf;
@@ -112,47 +116,34 @@ const SPINNER_FRAMES: [&str; 10] =
 
 // ─────────────────────────── palette ───────────────────────────
 //
-// We stick to *named* / 256-indexed terminal colours so the UI
-// respects whatever colour theme the user has configured for their
-// terminal (light, dark, Solarized, …) rather than baking in RGB
-// values that fight a user's theme.
+// One hue, one job. Background colour is reserved exclusively for
+// query matches — the most important pop-out signal in the UI — so
+// selection is signalled on the border (hue + bold) instead of as a
+// row background. Named / 256-indexed terminal colours throughout, so
+// the UI inherits the user's terminal theme rather than baking in RGB.
 
-/// Brand accent. Used for the pdffff pill, prompt, key chips, and
-/// the LITERAL mode pill.
-const ACCENT: Color = Color::Cyan;
-/// Subtle dim — borders, meta text, middot separators. We use the
-/// regular ANSI gray (7) rather than "bright black" (8 / DarkGray)
-/// because the latter is near-invisible on true-black terminals.
+/// Chrome — outer & card borders, prompt arrow, brand pill, key
+/// chips, mode pill background, separator rule. Saturated blue, the
+/// classic Norton-Commander-era status colour.
+const CHROME: Color = Color::Blue;
+/// Secondary text — meta lines, counters, idle/indexing status,
+/// numbering, separators. Regular ANSI gray (7) rather than
+/// "bright black" (8 / DarkGray) which is near-invisible on
+/// true-black terminals.
 const DIM: Color = Color::Gray;
-/// Border colour for the outer frame and the inline separator.
-const BORDER: Color = Color::Gray;
-/// Selection background for the currently-highlighted hit. Indexed
-/// 237 is a near-black grey on a 256-colour terminal which contrasts
-/// gently with most themes; it falls back to terminal default on
-/// 16-colour TTYs.
-const SEL_BG: Color = Color::Indexed(237);
-/// Foreground used for matched query substrings inside snippets.
-const HL_FG: Color = Color::Black;
-/// Background used for matched query substrings inside snippets.
+/// Primary text — query, filenames, brand wordmark, mode pill label.
+const PRIMARY: Color = Color::White;
+/// Focus accent — the only place magenta appears, applied to the
+/// border of the currently-selected card.
+const SEL: Color = Color::Magenta;
+/// Match highlight — reserved exclusively for query matches inside
+/// snippet bodies and card-title filenames. Reverse-video against
+/// yellow gives the highest selective power Bertin's "value"
+/// variable can offer on a 16-colour terminal.
 const HL_BG: Color = Color::Yellow;
-
-/// Pick a foreground that reads against a coloured pill background on
-/// both light and dark terminal themes.
-///
-/// `Color::Black` looked sharp on a paper-white terminal but vanished
-/// on dark themes where the user's "black" is mapped close to the
-/// terminal background; `Color::White` is the inverse trap on yellow.
-/// We pick per-background and never rely on `Modifier::BOLD` to do
-/// double duty as a brightness hint (some terminals interpret bold as
-/// "lighten the foreground", which moves black toward grey on cyan).
-fn pill_fg_for(bg: Color) -> Color {
-    match bg {
-        // Bright / pale backgrounds need dark text.
-        Color::Yellow | Color::LightYellow | Color::White | Color::Gray => Color::Black,
-        // Saturated / dark backgrounds need bright text.
-        _ => Color::White,
-    }
-}
+const HL_FG: Color = Color::Black;
+/// Error pill background. The single use of red in the UI.
+const ERROR: Color = Color::Red;
 
 /// Knobs for [`run_tui`]. The defaults are sensible for an interactive
 /// session against a small personal PDF library.
@@ -227,6 +218,11 @@ struct AppState {
     applied_stamp: u64,
     /// Wall-clock of the last spinner advance.
     spinner_started: Instant,
+    /// Index of the first card visible in the results area. Tracks
+    /// scroll position across renders so the view doesn't jump when the
+    /// terminal repaints. Mutated by the renderer once it knows the
+    /// available area; reset to 0 on every fresh result set.
+    scroll_top: usize,
     /// True once the user has pressed one of the quit keys.
     should_quit: bool,
     /// If Enter was pressed, the path:page:chunk of the hit the user
@@ -245,6 +241,7 @@ impl AppState {
             submitted_stamp: 0,
             applied_stamp: 0,
             spinner_started: Instant::now(),
+            scroll_top: 0,
             should_quit: false,
             chosen: None,
         }
@@ -288,7 +285,7 @@ fn run_event_loop(
     // keystroke).
     let mut last_progress_snapshot = snapshot_progress(progress);
 
-    terminal.draw(|f| render(f, &state, opts, progress))?;
+    terminal.draw(|f| render(f, &mut state, opts, progress))?;
 
     while !state.should_quit {
         let had_event = event::poll(TICK)?;
@@ -309,7 +306,7 @@ fn run_event_loop(
             || snap != last_progress_snapshot
             || snap.pending > 0
         {
-            terminal.draw(|f| render(f, &state, opts, progress))?;
+            terminal.draw(|f| render(f, &mut state, opts, progress))?;
             last_progress_snapshot = snap;
         }
     }
@@ -441,6 +438,7 @@ fn submit_query(state: &mut AppState, worker: &SearchWorker, limit: usize) {
     if state.query.trim().is_empty() {
         state.hits.clear();
         state.list_state.select(None);
+        state.scroll_top = 0;
         state.last_error = None;
         state.applied_stamp = state.submitted_stamp;
         return;
@@ -477,6 +475,7 @@ fn drain_results(state: &mut AppState, worker: &SearchWorker) -> bool {
             } else {
                 Some(0)
             });
+            state.scroll_top = 0;
         }
         Err(err) => {
             // Surface the error without nuking the previous hits — that
@@ -620,7 +619,7 @@ fn worker_loop(
 
 fn render(
     f: &mut Frame,
-    state: &AppState,
+    state: &mut AppState,
     opts: &TuiOptions,
     progress: &IndexProgress,
 ) {
@@ -632,13 +631,15 @@ fn render(
     f.render_widget(outer, size);
 
     // Vertical layout *inside* the outer frame.
-    //   row 0  : breathing room
+    //   row 0  : top breathing room
     //   row 1  : input + mode pill
     //   row 2  : separator (or inline error)
-    //   rest   : results list
+    //   row 3  : breathing room before the result cards
+    //   rest   : result cards
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -648,7 +649,7 @@ fn render(
 
     render_input(f, layout[1], state);
     render_error_or_hr(f, layout[2], state);
-    render_results(f, layout[3], state);
+    render_results(f, layout[4], state);
 }
 
 /// The outer rounded frame. Title-top-left carries the brand pill and
@@ -661,11 +662,11 @@ fn build_outer_frame<'a>(
 ) -> Block<'a> {
     let brand = Span::styled(
         " pdffff ",
-        Style::default().bg(ACCENT).fg(pill_fg_for(ACCENT)).add_modifier(Modifier::BOLD),
+        Style::default().bg(CHROME).fg(PRIMARY).add_modifier(Modifier::BOLD),
     );
     let root = Span::styled(
         format!(" {} ", opts.root.display()),
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
     );
     let top_left = Line::from(vec![Span::raw(" "), brand, root]).left_aligned();
 
@@ -679,10 +680,13 @@ fn build_outer_frame<'a>(
     let spinner_idx = (state.spinner_started.elapsed().as_millis()
         / TICK.as_millis()) as usize
         % SPINNER_FRAMES.len();
+    // Both branches use the same dim style — the spinner motion is the
+    // activity signal, no extra colour required (Norton-Commander-style
+    // status row, not a modern progress bar).
     let activity = if snap.pending > 0 {
         Span::styled(
             format!(" {} indexing {} ", SPINNER_FRAMES[spinner_idx], snap.pending),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default().fg(DIM),
         )
     } else {
         Span::styled(" idle ", Style::default().fg(DIM))
@@ -714,28 +718,33 @@ fn build_outer_frame<'a>(
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(BORDER))
+        .border_style(Style::default().fg(CHROME))
         .padding(Padding::new(1, 1, 0, 0))
         .title_top(top_left)
         .title_top(top_right)
         .title_bottom(help)
 }
 
-/// A keybinding label, styled bright against the dim help footer.
+/// A keybinding label, styled in the chrome hue against the dim help
+/// footer.
 fn key_chip(text: &str) -> Span<'_> {
     Span::styled(
         text,
         Style::default()
-            .fg(ACCENT)
+            .fg(CHROME)
             .add_modifier(Modifier::BOLD),
     )
 }
 
 fn render_input(f: &mut Frame, area: Rect, state: &AppState) {
-    let (mode_label, mode_bg) = match state.mode {
-        QueryMode::Literal => (" LITERAL ", Color::Cyan),
-        QueryMode::Regex => (" REGEX ", Color::Yellow),
-        QueryMode::Fuzzy => (" FUZZY ", Color::Magenta),
+    // Short labels: mode is a nominal distinction, and the label text
+    // itself encodes it. We do not lean on hue here — every mode pill
+    // shares the same chrome background, so hue stays free to do its
+    // one job (matches).
+    let mode_label = match state.mode {
+        QueryMode::Literal => " LIT ",
+        QueryMode::Regex => " RE ",
+        QueryMode::Fuzzy => " FZ ",
     };
     let mode_w = mode_label.chars().count() as u16;
 
@@ -750,19 +759,19 @@ fn render_input(f: &mut Frame, area: Rect, state: &AppState) {
 
     let prompt = Span::styled(
         "❯ ",
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(CHROME).add_modifier(Modifier::BOLD),
     );
     let query = Span::styled(
         state.query.clone(),
-        Style::default().add_modifier(Modifier::BOLD),
+        Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
     );
     f.render_widget(Paragraph::new(Line::from(vec![prompt, query])), cols[0]);
 
     let pill = Paragraph::new(Line::from(Span::styled(
         mode_label,
         Style::default()
-            .bg(mode_bg)
-            .fg(pill_fg_for(mode_bg))
+            .bg(CHROME)
+            .fg(PRIMARY)
             .add_modifier(Modifier::BOLD),
     )))
     .alignment(Alignment::Right);
@@ -792,8 +801,8 @@ fn render_error_or_hr(f: &mut Frame, area: Rect, state: &AppState) {
         let label = Span::styled(
             " error ",
             Style::default()
-                .bg(Color::Red)
-                .fg(pill_fg_for(Color::Red))
+                .bg(ERROR)
+                .fg(PRIMARY)
                 .add_modifier(Modifier::BOLD),
         );
         // Reserve room for the label, two spaces of padding, and a
@@ -804,20 +813,29 @@ fn render_error_or_hr(f: &mut Frame, area: Rect, state: &AppState) {
             Paragraph::new(Line::from(vec![
                 label,
                 Span::raw(" "),
-                Span::styled(truncated, Style::default().fg(Color::Red)),
+                Span::styled(truncated, Style::default().fg(ERROR)),
             ])),
             area,
         );
     } else if area.width > 0 {
         let bar = "─".repeat(area.width as usize);
         f.render_widget(
-            Paragraph::new(bar).style(Style::default().fg(BORDER)),
+            Paragraph::new(bar).style(Style::default().fg(CHROME)),
             area,
         );
     }
 }
 
-fn render_results(f: &mut Frame, area: Rect, state: &AppState) {
+/// Total vertical rows one result card occupies (top border + one
+/// snippet row + bottom border). Snippets are pre-bounded by the
+/// snippet builder; we never wrap, so a single content row suffices.
+const CARD_HEIGHT: u16 = 3;
+/// Blank rows between adjacent cards. Bertin: separation is itself a
+/// visual variable — explicit empty space says "different unit" more
+/// clearly than any divider could.
+const CARD_GAP: u16 = 1;
+
+fn render_results(f: &mut Frame, area: Rect, state: &mut AppState) {
     if state.hits.is_empty() {
         let msg = if state.query.trim().is_empty() {
             "type a query to search the index"
@@ -833,71 +851,155 @@ fn render_results(f: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    let items: Vec<ListItem> = state
-        .hits
-        .iter()
-        .enumerate()
-        .map(|(i, hit)| render_hit_item(i, hit, &state.query, state.mode))
-        .collect();
+    let visible = visible_card_count(area.height);
+    if visible == 0 {
+        return;
+    }
+    let selected = state.list_state.selected().unwrap_or(0);
+    state.scroll_top =
+        compute_scroll_top(selected, state.hits.len(), visible, state.scroll_top);
+    let scroll_top = state.scroll_top;
 
-    let list = List::new(items)
-        .highlight_style(
-            Style::default().bg(SEL_BG).add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▌ ")
-        .highlight_spacing(HighlightSpacing::Always);
-
-    let mut list_state = state.list_state.clone();
-    f.render_stateful_widget(list, area, &mut list_state);
+    let n = visible.min(state.hits.len() - scroll_top);
+    for slot in 0..n {
+        let i = scroll_top + slot;
+        let y = area.y + slot as u16 * (CARD_HEIGHT + CARD_GAP);
+        if y + CARD_HEIGHT > area.y + area.height {
+            break;
+        }
+        let card_area = Rect::new(area.x, y, area.width, CARD_HEIGHT);
+        render_hit_card(
+            f,
+            card_area,
+            i,
+            &state.hits[i],
+            &state.query,
+            state.mode,
+            i == selected,
+        );
+    }
 }
 
-fn render_hit_item(i: usize, hit: &Hit, query: &str, mode: QueryMode) -> ListItem<'static> {
+/// How many cards fit in `height` rows, given `CARD_HEIGHT` rows per
+/// card and `CARD_GAP` blank rows between cards. Returns 0 when even
+/// one card would not fit.
+fn visible_card_count(height: u16) -> usize {
+    if height < CARD_HEIGHT {
+        return 0;
+    }
+    // n cards take CARD_HEIGHT + (n-1) * (CARD_HEIGHT + CARD_GAP) rows.
+    let extra = height - CARD_HEIGHT;
+    1 + (extra / (CARD_HEIGHT + CARD_GAP)) as usize
+}
+
+/// Pick a scroll position that keeps `selected` visible while disturbing
+/// `prev` as little as possible. The selection moves by user input; the
+/// scroll position only shifts when selection would otherwise fall out
+/// of frame.
+fn compute_scroll_top(
+    selected: usize,
+    total: usize,
+    visible: usize,
+    prev: usize,
+) -> usize {
+    if total == 0 || visible == 0 {
+        return 0;
+    }
+    let max_top = total.saturating_sub(visible);
+    let mut top = prev.min(max_top);
+    if selected < top {
+        top = selected;
+    } else if selected >= top + visible {
+        top = selected + 1 - visible;
+    }
+    top.min(max_top)
+}
+
+fn render_hit_card(
+    f: &mut Frame,
+    area: Rect,
+    i: usize,
+    hit: &Hit,
+    query: &str,
+    mode: QueryMode,
+    selected: bool,
+) {
     // Score is only meaningful in fuzzy mode (it's the neo_frizbee u16
     // turned into f32). For literal and regex matches it is a hardcoded
     // `1.0` — showing it there is noise, so we hide the field.
     let meta = match mode {
         QueryMode::Fuzzy => format!(
-            "p.{} · #{} · score {:.2}",
+            " p.{} · #{} · score {:.2} ",
             hit.page_no, hit.chunk_ord, hit.score,
         ),
         QueryMode::Literal | QueryMode::Regex => {
-            format!("p.{} · #{}", hit.page_no, hit.chunk_ord)
+            format!(" p.{} · #{} ", hit.page_no, hit.chunk_ord)
         }
     };
+
     // Display the filename rather than the full path: the full path is
     // typically the watched root + a long suffix, which crowds the
     // header off the right edge and adds no information the user can't
-    // get from the corpus context.
-    let header = Line::from(vec![
-        Span::styled(
-            format!("{:>2}. ", i + 1),
-            Style::default().fg(DIM),
-        ),
-        Span::styled(
-            hit.filename.clone(),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ·  ", Style::default().fg(DIM)),
-        Span::styled(meta, Style::default().fg(DIM)),
-    ]);
+    // get from the corpus context. The filename inherits the highlight
+    // style so a filename match (the whole reason there's a
+    // filename-priority band in the fuzzy ranker) is visible at a
+    // glance.
+    let name_base = Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD);
+    let filename_spans = highlight_spans(&hit.filename, query, name_base, match_hl_style());
 
-    let mut snippet_spans: Vec<Span<'static>> = vec![Span::raw("   ")];
-    snippet_spans.extend(highlight_snippet_spans(&hit.snippet, query));
-    ListItem::new(vec![header, Line::from(snippet_spans)])
+    let mut title_left_spans: Vec<Span<'static>> = vec![
+        Span::raw(" "),
+        Span::styled(format!("{}. ", i + 1), Style::default().fg(DIM)),
+    ];
+    title_left_spans.extend(filename_spans);
+    title_left_spans.push(Span::raw(" "));
+    let title_left = Line::from(title_left_spans).left_aligned();
+
+    let title_right =
+        Line::from(Span::styled(meta, Style::default().fg(DIM))).right_aligned();
+
+    let border_style = if selected {
+        Style::default().fg(SEL).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(CHROME)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .title_top(title_left)
+        .title_top(title_right);
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let snippet_spans =
+        highlight_spans(&hit.snippet, query, Style::default(), match_hl_style());
+    f.render_widget(Paragraph::new(Line::from(snippet_spans)), inner);
 }
 
-/// Render `snippet` as a list of styled spans, painting case-insensitive
-/// substring matches for `query` (or its whitespace-split terms) on a
-/// yellow background. Greedy left-to-right, longest-needle-wins — so a
-/// match on the full phrase takes precedence over its constituent
-/// terms. UTF-8 safe.
+/// The single match-highlight style, used identically in card titles
+/// and snippet bodies. Centralising it makes the "yellow background is
+/// reserved for matches" invariant a one-liner to audit.
+fn match_hl_style() -> Style {
+    Style::default()
+        .bg(HL_BG)
+        .fg(HL_FG)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Render `text` as a list of styled spans, painting case-insensitive
+/// substring matches for `query` (or its whitespace-split terms) with
+/// `hl` and the unmatched runs with `base`. Greedy left-to-right,
+/// longest-needle-wins — so a match on the full phrase takes
+/// precedence over its constituent terms. UTF-8 safe.
 ///
 /// Three composed passes:
 ///
 /// 1. [`build_needles`] — phrase + whitespace-split terms, deduped and
 ///    sorted longest-first so the greedy matcher prefers the phrase
 ///    over its constituents.
-/// 2. [`build_lc_offset_map`] — a lowercased copy of `snippet` and a
+/// 2. [`build_lc_offset_map`] — a lowercased copy of `text` and a
 ///    table mapping lowercase byte offsets back to original byte
 ///    offsets. Lowercasing changes byte length per codepoint, so the
 ///    table is the only correct way to recover original-side spans.
@@ -906,15 +1008,29 @@ fn render_hit_item(i: usize, hit: &Hit, query: &str, mode: QueryMode) -> ListIte
 ///    `Range<usize>`s.
 ///
 /// Span construction then weaves the unhighlighted runs between the
-/// match ranges.
-fn highlight_snippet_spans(snippet: &str, query: &str) -> Vec<Span<'static>> {
+/// match ranges. The function is style-agnostic so the same pipeline
+/// drives both snippet bodies (default base) and card titles (white
+/// bold base).
+fn highlight_spans(
+    text: &str,
+    query: &str,
+    base: Style,
+    hl: Style,
+) -> Vec<Span<'static>> {
     let needles = build_needles(query);
     if needles.is_empty() {
-        return vec![Span::raw(snippet.to_string())];
+        return vec![Span::styled(text.to_string(), base)];
     }
-    let map = build_lc_offset_map(snippet);
-    let ranges = scan_for_match_ranges(snippet, &map, &needles);
-    weave_spans(snippet, &ranges)
+    let map = build_lc_offset_map(text);
+    let ranges = scan_for_match_ranges(text, &map, &needles);
+    weave_spans(text, &ranges, base, hl)
+}
+
+/// Test-friendly wrapper that fixes the styles to the snippet defaults
+/// (no base style, match-highlight style for hits).
+#[cfg(test)]
+fn highlight_snippet_spans(snippet: &str, query: &str) -> Vec<Span<'static>> {
+    highlight_spans(snippet, query, Style::default(), match_hl_style())
 }
 
 /// Ordered, deduped match needles: full phrase + whitespace-split terms,
@@ -1015,26 +1131,25 @@ fn scan_for_match_ranges(
 }
 
 /// Weave the unhighlighted prefixes / suffixes between the highlighted
-/// match `ranges` into a span list.
+/// match `ranges` into a span list, applying `base` to the unmatched
+/// runs and `hl` to the matches.
 fn weave_spans(
-    snippet: &str,
+    text: &str,
     ranges: &[std::ops::Range<usize>],
+    base: Style,
+    hl: Style,
 ) -> Vec<Span<'static>> {
-    let hl = Style::default()
-        .bg(HL_BG)
-        .fg(HL_FG)
-        .add_modifier(Modifier::BOLD);
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut cursor = 0usize;
     for r in ranges {
         if cursor < r.start {
-            spans.push(Span::raw(snippet[cursor..r.start].to_string()));
+            spans.push(Span::styled(text[cursor..r.start].to_string(), base));
         }
-        spans.push(Span::styled(snippet[r.start..r.end].to_string(), hl));
+        spans.push(Span::styled(text[r.start..r.end].to_string(), hl));
         cursor = r.end;
     }
-    if cursor < snippet.len() {
-        spans.push(Span::raw(snippet[cursor..].to_string()));
+    if cursor < text.len() {
+        spans.push(Span::styled(text[cursor..].to_string(), base));
     }
     spans
 }
@@ -1128,5 +1243,39 @@ mod tests {
         assert_eq!(render(&spans), "a foo bar b");
         assert_eq!(spans.len(), 3);
         assert_eq!(spans[1].content.as_ref(), "foo bar");
+    }
+
+    // ── card-layout maths ─────────────────────────────────────────────
+
+    #[test]
+    fn visible_card_count_respects_card_geometry() {
+        // CARD_HEIGHT = 3, CARD_GAP = 1 → 3, 7, 11, 15 rows fit 1, 2, 3, 4.
+        assert_eq!(visible_card_count(0), 0);
+        assert_eq!(visible_card_count(2), 0);
+        assert_eq!(visible_card_count(3), 1);
+        assert_eq!(visible_card_count(6), 1);
+        assert_eq!(visible_card_count(7), 2);
+        assert_eq!(visible_card_count(10), 2);
+        assert_eq!(visible_card_count(11), 3);
+    }
+
+    #[test]
+    fn scroll_top_keeps_selection_in_frame() {
+        // Selection inside the visible window: scroll_top doesn't move.
+        assert_eq!(compute_scroll_top(2, 20, 5, 0), 0);
+        // Selection past the bottom of the window: scroll_top advances
+        // just enough to keep it visible.
+        assert_eq!(compute_scroll_top(5, 20, 5, 0), 1);
+        assert_eq!(compute_scroll_top(9, 20, 5, 0), 5);
+        // Selection above the window: scroll_top jumps back to it.
+        assert_eq!(compute_scroll_top(2, 20, 5, 7), 2);
+        // Stale prev gets clamped to max_top so we never paint past the
+        // end of the list.
+        assert_eq!(compute_scroll_top(19, 20, 5, 999), 15);
+        // List shorter than the window: scroll_top is pinned at 0.
+        assert_eq!(compute_scroll_top(2, 3, 5, 4), 0);
+        // Degenerate inputs don't panic.
+        assert_eq!(compute_scroll_top(0, 0, 5, 0), 0);
+        assert_eq!(compute_scroll_top(0, 5, 0, 0), 0);
     }
 }
